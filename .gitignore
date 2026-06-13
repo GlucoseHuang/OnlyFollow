@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+*.xcscheme
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Package.resolved
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+# CocoaPods / Carthage (not used here, but safe defaults)
+Pods/
+Carthage/Build/
+
+# Misc
+*.swp
+*.swo
+*~
