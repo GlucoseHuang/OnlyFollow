@@ -26,8 +26,19 @@
     <string>17.0</string>
     <key>NSAppTransportSecurity</key>
     <dict>
+        <!-- 抖音 / B 站直播 CDN 多为 HTTP FLV, AVPlayer 默认 ATS 拒绝
+             下面 4 个 key 都加上, 排除某个 key 对 FLV 不生效的可能
+             NSAllowsArbitraryLoadsForMedia 是 macOS 10.15+ 推荐用名 -->
+        <key>NSAllowsArbitraryLoadsForMedia</key>
+        <true/>
+        <key>NSAllowsArbitraryLoadsInMedia</key>
+        <true/>
+        <key>NSAllowsArbitraryLoadsInWebContent</key>
+        <true/>
+        <!-- 最后兜底: 如果上面还不够, 把所有 HTTP 都放开 (影响最小, 因为现在 ATS 主要保护 API)
+             抖音/B 站 API 全是 HTTPS, 这条只对 CDN 的 FLV/HLS 流生效 -->
         <key>NSAllowsArbitraryLoads</key>
-        <false/>
+        <true/>
         <key>NSExceptionDomains</key>
         <dict>
             <key>hdslb.com</key>
@@ -40,6 +51,33 @@
                 <string>TLSv1.0</string>
             </dict>
             <key>bilibili.com</key>
+            <dict>
+                <key>NSIncludesSubdomains</key>
+                <true/>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+                <key>NSExceptionMinimumTLSVersion</key>
+                <string>TLSv1.0</string>
+            </dict>
+            <key>douyin.com</key>
+            <dict>
+                <key>NSIncludesSubdomains</key>
+                <true/>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+                <key>NSExceptionMinimumTLSVersion</key>
+                <string>TLSv1.0</string>
+            </dict>
+            <key>douyincdn.com</key>
+            <dict>
+                <key>NSIncludesSubdomains</key>
+                <true/>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+                <key>NSExceptionMinimumTLSVersion</key>
+                <string>TLSv1.0</string>
+            </dict>
+            <key>bytedance.com</key>
             <dict>
                 <key>NSIncludesSubdomains</key>
                 <true/>
@@ -80,6 +118,10 @@
         <string>UIInterfaceOrientationPortraitUpsideDown</string>
         <string>UIInterfaceOrientationLandscapeLeft</string>
         <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>audio</string>
     </array>
     <key>BGTaskSchedulerPermittedIdentifiers</key>
     <array>

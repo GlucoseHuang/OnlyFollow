@@ -22,6 +22,9 @@ final class PlaylistItem {
     var order: Int
     var addedAt: Date
 
+    /// 多设备同步用的最后修改时间。order 变动时需要刷新这个值（后写获胜）。
+    var lastModifiedAt: Date = Date()
+
     init(video: VideoItem, order: Int) {
         self.aid = video.aid
         self.bvid = video.bvid
@@ -59,7 +62,9 @@ final class PlaylistItem {
             authorUID: authorUID,
             authorName: authorName,
             authorAvatar: authorAvatar,
-            platform: platform
+            platform: platform,
+            ugcSeasonID: nil,
+            ugcSeasonTitle: nil
         )
     }
 }

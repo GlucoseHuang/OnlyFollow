@@ -1,12 +1,14 @@
 import SwiftUI
+import SwiftData
 
 struct LiveRoomCard: View {
     let room: LiveRoom
-    @State private var showLiveRoom = false
+    @Environment(\.modelContext) private var modelContext
 
     var body: some View {
         Button {
-            showLiveRoom = true
+            // 走 UIKit 全屏 present，跟视频侧 PlayerPresenter 一致
+            PlayerPresenter.present(room, modelContext: modelContext)
         } label: {
             HStack(spacing: 12) {
                 AsyncImage(url: URL(string: room.authorAvatar)) { image in
@@ -39,8 +41,5 @@ struct LiveRoomCard: View {
             .background(.background.secondary, in: .rect(cornerRadius: 12))
         }
         .buttonStyle(.plain)
-        .sheet(isPresented: $showLiveRoom) {
-            LiveRoomView(room: room)
-        }
     }
 }

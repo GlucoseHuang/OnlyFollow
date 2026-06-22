@@ -41,6 +41,12 @@ final class BilibiliSessionManager: Sendable {
         return _loginState
     }
 
+    /// 当前已获取到的 buvid3（用作弹幕鉴权 payload）；空表示还没拉到
+    var buvid3: String {
+        lock.lock(); defer { lock.unlock() }
+        return _buvid3
+    }
+
     /// 完整的 cookie 字符串（合并用户 cookie + 自动获取的 buvid）
     var cookieString: String {
         lock.lock()

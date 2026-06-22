@@ -16,6 +16,10 @@ enum AppLogger {
         log(level: "ERROR", message, file: file, line: line)
     }
 
+    static func warning(_ message: String, file: String = #file, line: Int = #line) {
+        log(level: "WARN", message, file: file, line: line)
+    }
+
     static func debug(_ message: String, file: String = #file, line: Int = #line) {
         log(level: "DEBUG", message, file: file, line: line)
     }

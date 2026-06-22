@@ -20,6 +20,9 @@ final class FavoriteVideo {
     var platform: String
     var addedAt: Date
 
+    /// 多设备同步用的最后修改时间。收藏一旦加进去几乎不会变，所以基本就是 addedAt。
+    var lastModifiedAt: Date = Date()
+
     init(video: VideoItem) {
         self.aid = video.aid
         self.bvid = video.bvid
@@ -56,7 +59,9 @@ final class FavoriteVideo {
             authorUID: authorUID,
             authorName: authorName,
             authorAvatar: authorAvatar,
-            platform: platform
+            platform: platform,
+            ugcSeasonID: nil,
+            ugcSeasonTitle: nil
         )
     }
 }

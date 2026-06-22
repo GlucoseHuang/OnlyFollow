@@ -23,4 +23,8 @@ struct VideoItem: Identifiable, Codable, Sendable, Equatable {
     let authorName: String
     let authorAvatar: String
     let platform: String
+    /// B 站 UGC 合集 ID(nil = 不在任何合集中);只在 fetchVideoDetail 后才有
+    let ugcSeasonID: Int?
+    /// B 站 UGC 合集标题(配合 ugcSeasonID 用, 给合集列表头展示)
+    let ugcSeasonTitle: String?
 }

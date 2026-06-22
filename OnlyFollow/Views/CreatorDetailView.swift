@@ -7,17 +7,13 @@ struct CreatorDetailView: View {
     /// 用 @Query 监听播放列表，左滑加入/移除后按钮状态会自动刷新
     @Query private var playlistItems: [PlaylistItem]
     @State private var isLoading = false
-    @State private var isLoadingMore = false
     @State private var errorMessage: String?
-    @State private var hasMore = true
-    @State private var nextPage = 1
     @State private var showFavorites = false
     @State private var showPlaylist = false
     @State private var showUnfollowConfirm = false
     /// 手动触发的 bulk fetch 任务（让用户一键补全该 UP 主历史视频）
     @State private var bulkFetchTask: Task<Void, Never>?
     @State private var isBulkFetching = false
-    private let pageSize = 20
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
 
@@ -26,6 +22,11 @@ struct CreatorDetailView: View {
     private var videos: [VideoItem] { cache.videosByCreator[creator.uid] ?? [] }
     private var liveRoom: LiveRoom? { cache.liveRoom(for: creator.uid) }
     private var playlistAidSet: Set<Int> { Set(playlistItems.map(\.aid)) }
+
+    /// 该 UP 主的视频总数：优先用 API 返回的 total，否则用已加载的 cache 数
+    private var totalVideoCount: Int {
+        creator.bulkFetchTotal > 0 ? creator.bulkFetchTotal : videos.count
+    }
 
     var body: some View {
         List {
@@ -53,12 +54,6 @@ struct CreatorDetailView: View {
                 ForEach(videos) { video in
                     videoRow(for: video)
                 }
-
-                Section {
-                    loadMoreRow
-                }
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
             }
         }
         .listStyle(.plain)
@@ -133,30 +128,6 @@ struct CreatorDetailView: View {
         }
     }
 
-    @ViewBuilder
-    private var loadMoreRow: some View {
-        if hasMore {
-            Button {
-                Task { await loadMore() }
-            } label: {
-                HStack {
-                    if isLoadingMore { ProgressView().scaleEffect(0.7) }
-                    Text(isLoadingMore ? "加载中..." : "加载更多")
-                }
-                .font(.subheadline)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-            }
-            .disabled(isLoadingMore)
-        } else {
-            Text("已经到底了")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-        }
-    }
-
     private var creatorHeader: some View {
         HStack(spacing: 16) {
             AsyncImage(url: URL(string: ensureHTTPS(creator.avatarURL))) { image in
@@ -170,7 +141,7 @@ struct CreatorDetailView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(creator.nickname)
                     .font(.title3.bold())
-                Text(creator.platform)
+                Text("共 \(totalVideoCount) 个视频")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -180,8 +151,9 @@ struct CreatorDetailView: View {
     }
 
     private func liveBanner(room: LiveRoom) -> some View {
-        NavigationLink {
-            LiveRoomView(room: room)
+        Button {
+            // 走 UIKit 全屏 present，跟视频侧 PlayerPresenter 一致
+            PlayerPresenter.present(room, modelContext: modelContext)
         } label: {
             HStack {
                 Circle().fill(.red).frame(width: 10, height: 10)
@@ -195,13 +167,15 @@ struct CreatorDetailView: View {
             .padding(12)
             .background(.red.opacity(0.1), in: .rect(cornerRadius: 10))
         }
+        .buttonStyle(.plain)
     }
 
     /// 单个视频行：左滑 -> 加入播放列表
     private func videoRow(for video: VideoItem) -> some View {
         let inPlaylist = playlistAidSet.contains(video.aid)
-        return NavigationLink {
-            VideoPlayerView(video: video, modelContext: modelContext)
+        return Button {
+            // 走 UIKit 全屏 present，绕开 NavigationLink push 的非全屏问题
+            PlayerPresenter.present(video, modelContext: modelContext)
         } label: {
             CreatorVideoRow(video: video)
         }
@@ -222,7 +196,7 @@ struct CreatorDetailView: View {
         let descriptor = FetchDescriptor<PlaylistItem>(sortBy: [SortDescriptor(\.order, order: .reverse)])
         let maxOrder = (try? modelContext.fetch(descriptor).first?.order) ?? -1
         modelContext.insert(PlaylistItem(video: video, order: maxOrder + 1))
-        try? modelContext.save()
+        modelContext.saveAndKickSync()
     }
 
     // MARK: - 数据加载
@@ -230,8 +204,6 @@ struct CreatorDetailView: View {
     private func refresh() async {
         isLoading = true
         errorMessage = nil
-        nextPage = 1
-        hasMore = true
         let api = BilibiliAPIService.shared
         do {
             switch creator.platform {
@@ -254,12 +226,34 @@ struct CreatorDetailView: View {
                     cache.setLiveRoom(room, for: creator.uid)
                 }
 
-                let v = try await api.fetchUserVideos(mid: creator.uid, page: nextPage, pageSize: pageSize)
+                // 拉首页 30 条（bulk fetch 会接着往后拉，详情页不再做手动加载更多）
+                let v = try await api.fetchUserVideos(mid: creator.uid, page: 1, pageSize: 30)
                 cache.setVideos(v, for: creator.uid)
-                hasMore = v.count >= pageSize
-                nextPage = 2
             case "douyin":
-                errorMessage = "抖音暂未支持"
+                // 抖音：拿用户信息（含 live_room 字段） + 视频列表
+                let dyApi = DouyinAPIService.shared
+                let info = try await dyApi.fetchUserInfo(secUid: creator.uid)
+                // 直播：如果有 live_room 字段且开播
+                if let live = info.liveRoomInfo {
+                    let room = LiveRoom(
+                        id: live.roomId ?? "",
+                        roomID: live.roomId ?? "",
+                        title: live.title ?? "",
+                        coverURL: ensureHTTPS(live.coverURL ?? ""),
+                        streamURL: live.streamURL ?? "",
+                        viewerCount: live.viewerCount ?? 0,
+                        authorUID: creator.uid,
+                        authorName: creator.nickname,
+                        authorAvatar: ensureHTTPS(creator.avatarURL),
+                        platform: "douyin",
+                        isLive: live.isLiving ?? false
+                    )
+                    cache.setLiveRoom(room, for: creator.uid)
+                }
+                // 视频列表（首页 20 条）
+                let resp = try await dyApi.fetchUserVideos(secUid: creator.uid, maxCursor: 0, count: 40)
+                let v = (resp.awemeList ?? []).map { $0.toVideoItem() }
+                cache.setVideos(v, for: creator.uid)
             default:
                 break
             }
@@ -277,7 +271,7 @@ struct CreatorDetailView: View {
     private func unfollow() {
         AppLogger.info("Unfollow creator: uid=\(creator.uid), name=\(creator.nickname)")
         modelContext.delete(creator)
-        try? modelContext.save()
+        modelContext.saveAndKickSync()
         dismiss()
     }
 
@@ -349,21 +343,6 @@ struct CreatorDetailView: View {
             AppLogger.info("CreatorDetailView: 手动补全 \(creator.nickname) 跑了 \(processed) 页")
             isBulkFetching = false
         }
-    }
-
-    private func loadMore() async {
-        guard !isLoadingMore, hasMore else { return }
-        isLoadingMore = true
-        let api = BilibiliAPIService.shared
-        do {
-            let more = try await api.fetchUserVideos(mid: creator.uid, page: nextPage, pageSize: pageSize)
-            cache.appendVideos(more, for: creator.uid)
-            hasMore = more.count >= pageSize
-            nextPage += 1
-        } catch {
-            AppLogger.error("CreatorDetail loadMore failed: \(error.localizedDescription)")
-        }
-        isLoadingMore = false
     }
 }
 

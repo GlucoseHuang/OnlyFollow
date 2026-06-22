@@ -88,7 +88,7 @@ struct AddFollowView: View {
         AppLogger.info("Adding creator: uid=\(creator.uid), name=\(creator.nickname), platform=\(creator.platform)")
         modelContext.insert(creator)
         // 立即保存
-        try? modelContext.save()
+        modelContext.saveAndKickSync()
         AppLogger.info("Creator inserted and saved to modelContext")
         // 先回调（让 ContentView 在 sheet 关闭前启动同步），再关闭
         onAdded?(creator)
@@ -120,7 +120,21 @@ struct AddFollowView: View {
                         avatarURL: ensureHTTPS(info.face)
                     )
                 case .douyin:
-                    errorMessage = "抖音搜索暂未实现，v0.1 仅支持 B 站添加关注"
+                    // 抖音 fetchUserInfo 只接受 sec_user_id（以 MS4w 开头的长串）
+                    // 数字形式的“抖音号”（unique_id，如 88805309602）需要先走搜索接口转 sec_uid
+                    // v0.1 暂不支持该转换，提示用户
+                    guard uid.hasPrefix("MS4w") else {
+                        throw DouyinAPIError.parseError("需要粘贴抖音主页链接或 sec_user_id（数字抖音号暂不支持，请用浏览器打开主播主页拷贝 URL）")
+                    }
+                    let api = DouyinAPIService.shared
+                    let info = try await api.fetchUserInfo(secUid: uid)
+                    AppLogger.info("抖音用户信息: nickname=\(info.nickname ?? "<nil>"), secUid=\(info.secUid?.prefix(12) ?? "<nil>")..., fans=\(info.followerCount ?? 0)")
+                    searchResult = FollowedCreator(
+                        uid: info.secUid ?? uid,
+                        platform: "douyin",
+                        nickname: info.nickname ?? uid,
+                        avatarURL: ensureHTTPS(info.avatarURL ?? "")
+                    )
                 }
             } catch {
                 AppLogger.error("搜索失败: \(error.localizedDescription)")
@@ -131,14 +145,27 @@ struct AddFollowView: View {
     }
 
     private func extractUID(from text: String) -> String {
-        if let url = URL(string: text), let host = url.host {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // URL 解析（提取末段作为 sec_user_id 或 mid）
+        if let url = URL(string: trimmed), let host = url.host {
             if host.contains("bilibili.com") {
-                return url.pathComponents.last ?? text
+                return url.pathComponents.last ?? trimmed
             }
             if host.contains("douyin.com") {
-                return url.pathComponents.last ?? text
+                // 抖音 URL 形如 https://www.douyin.com/user/{sec_uid}
+                // 末段就是 sec_uid（MS4wLjAB... 开头的长串）
+                let last = url.pathComponents.last ?? trimmed
+                if last.hasPrefix("MS4w") { return last }
+                // 末段不是 sec_uid 格式，说明 URL 形如 /video/{aweme_id} 或 /note/{id} 或短链
+                // 这种情况下无法直接拿到 sec_uid，留给调用方处理
+                return last
             }
         }
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 纯字符串
+        if trimmed.hasPrefix("MS4w") {
+            // 是 sec_user_id（B 站 mid 一般是纯数字）
+            return trimmed
+        }
+        return trimmed
     }
 }

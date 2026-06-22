@@ -19,11 +19,13 @@ struct FavoritesView: View {
                 } else {
                     List {
                         ForEach(favorites) { fav in
-                            NavigationLink {
-                                VideoPlayerView(video: fav.toVideoItem(), modelContext: modelContext)
+                            Button {
+                                // 走 UIKit 全屏 present，绕开 NavigationLink push 的非全屏问题
+                                PlayerPresenter.present(fav.toVideoItem(), modelContext: modelContext)
                             } label: {
                                 FavoriteRow(fav: fav)
                             }
+                            .buttonStyle(.plain)
                         }
                         .onDelete(perform: deleteFavorites)
                     }
@@ -48,7 +50,7 @@ struct FavoritesView: View {
         for index in offsets {
             modelContext.delete(favorites[index])
         }
-        try? modelContext.save()
+        modelContext.saveAndKickSync()
     }
 }
 

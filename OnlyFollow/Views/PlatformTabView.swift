@@ -3,7 +3,8 @@ import SwiftData
 
 struct PlatformTabView: View {
     @Binding var selectedPlatform: Platform
-    @Binding var showLogin: Bool
+    /// 用户在 PlatformTabView 内部(比如 loginBanner)点"去登录"时,通知 ContentView 弹出 login sheet
+    var onRequestLogin: (() -> Void)? = nil
     @Query private var creators: [FollowedCreator]
     @Environment(\.modelContext) private var modelContext
 
@@ -11,9 +12,11 @@ struct PlatformTabView: View {
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var loginState: BilibiliLoginState = .unknown
-    @State private var showFavorites = false
-    @State private var showPlaylist = false
-    @State private var showHistory = false
+    /// 抖音登录态 — 只要 AppSettings 里有 cookie 就算已登录
+    @State private var douyinHasSession: Bool = AppSettings.hasDouyinCookie
+    /// 单 sheet 模式:避免堆 3 个 .sheet(isPresented:) 引发 hit-test 问题(同 ContentView)
+    @State private var activeMineSheet: MineSheet?
+    @State private var douyinLoginPresented = false
     /// .refreshable 在某些情况下会被 SwiftUI 取消它的 Task，
     /// 所以真正的工作放在这里 spawn 的独立 Task 里——它不继承 .refreshable 的取消链。
     @State private var refreshTask: Task<Void, Never>?
@@ -29,6 +32,9 @@ struct PlatformTabView: View {
 
             if selectedPlatform == .bilibili, needsLoginBanner {
                 loginBanner
+            }
+            if selectedPlatform == .douyin, !douyinHasSession {
+                douyinLoginBanner
             }
 
             if filteredCreators.isEmpty {
@@ -96,14 +102,15 @@ struct PlatformTabView: View {
             let hasAnyCache = !cache.videosByCreator.isEmpty
             if !hasAnyCache { await refreshData() }
         }
-        .sheet(isPresented: $showFavorites) {
-            FavoritesView()
+        .sheet(item: $activeMineSheet) { sheet in
+            switch sheet {
+            case .favorites: FavoritesView()
+            case .playlist: PlaylistView()
+            case .history: HistoryView()
+            }
         }
-        .sheet(isPresented: $showPlaylist) {
-            PlaylistView()
-        }
-        .sheet(isPresented: $showHistory) {
-            HistoryView()
+        .sheet(isPresented: $douyinLoginPresented) {
+            DouyinLoginView(isPresented: $douyinLoginPresented)
         }
         .onReceive(
             NotificationCenter.default
@@ -114,12 +121,19 @@ struct PlatformTabView: View {
                 loginState = state
             }
         }
+        .onReceive(
+            NotificationCenter.default
+                .publisher(for: DouyinSessionManager.loginSucceededNotification)
+                .receive(on: RunLoop.main)
+        ) { _ in
+            douyinHasSession = AppSettings.hasDouyinCookie
+        }
     }
 
     /// 顶部三个入口：⭐ 收藏 / ▶ 播放列表 / 🕘 历史
     private var mineEntryRow: some View {
         HStack(spacing: 10) {
-            Button { showFavorites = true } label: {
+            Button { activeMineSheet = .favorites } label: {
                 Label("收藏", systemImage: "star.fill")
                     .font(.caption.bold())
                     .frame(maxWidth: .infinity)
@@ -127,7 +141,7 @@ struct PlatformTabView: View {
                     .background(.yellow.opacity(0.15), in: .rect(cornerRadius: 8))
                     .foregroundStyle(.orange)
             }
-            Button { showPlaylist = true } label: {
+            Button { activeMineSheet = .playlist } label: {
                 Label("播放列表", systemImage: "list.bullet.rectangle.fill")
                     .font(.caption.bold())
                     .frame(maxWidth: .infinity)
@@ -135,7 +149,7 @@ struct PlatformTabView: View {
                     .background(.blue.opacity(0.15), in: .rect(cornerRadius: 8))
                     .foregroundStyle(.blue)
             }
-            Button { showHistory = true } label: {
+            Button { activeMineSheet = .history } label: {
                 Label("历史", systemImage: "clock.arrow.circlepath")
                     .font(.caption.bold())
                     .frame(maxWidth: .infinity)
@@ -200,7 +214,7 @@ struct PlatformTabView: View {
     @ViewBuilder
     private var loginBanner: some View {
         Button {
-            showLogin = true
+            onRequestLogin?()
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: "qrcode")
@@ -238,6 +252,34 @@ struct PlatformTabView: View {
     private var bannerSubtitle: String {
         if case .loggedOut = loginState { return "登录后可以查看关注 UP 主的最新视频" }
         return "扫码后可立即查看最新视频"
+    }
+
+    @ViewBuilder
+    private var douyinLoginBanner: some View {
+        Button {
+            douyinLoginPresented = true
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "qrcode")
+                    .font(.title3)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("扫码登录抖音").font(.subheadline).bold()
+                    Text("登录后可以查看博主的最新视频和直播状态")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .background(.orange.opacity(0.15), in: .rect(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(.orange.opacity(0.4), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal)
+        .padding(.top, 8)
     }
 
     private var emptyView: some View {
@@ -285,6 +327,11 @@ struct CreatorRow: View {
     let videos: [VideoItem]
     let isLoading: Bool
 
+    /// UP 主视频总数：API 返回的 total 已知时优先用，否则用已加载的 cache 数
+    private var totalVideoCount: Int {
+        creator.bulkFetchTotal > 0 ? creator.bulkFetchTotal : videos.count
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
@@ -307,6 +354,10 @@ struct CreatorRow: View {
                             .foregroundStyle(.red)
                         }
                     }
+                    // UP 主视频总数：API 总数已知时优先用，否则用已加载的 cache 数
+                    Text("\(totalVideoCount) 个视频")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
 
                 Spacer()
@@ -337,5 +388,20 @@ struct CreatorRow: View {
         }
         .padding(12)
         .background(.background.secondary, in: .rect(cornerRadius: 12))
+    }
+}
+
+/// PlatformTabView 顶层唯一的二级页面路由(收藏/播放列表/历史)
+enum MineSheet: Identifiable {
+    case favorites
+    case playlist
+    case history
+
+    var id: String {
+        switch self {
+        case .favorites: return "favorites"
+        case .playlist: return "playlist"
+        case .history: return "history"
+        }
     }
 }

@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+// 抖音直播弹幕协议 — 来源 skmcj/dycast 的逆向结果
+// 这里只列出我们关心的字段。完整字段 200+,参考：
+// https://github.com/skmcj/dycast
+
+// MARK: - PushFrame (外层二进制帧)
+message PushFrame {
+  uint64 seqId = 1;
+  uint64 logId = 2;
+  uint64 service = 3;
+  uint64 method = 4;
+  repeated Header headers = 5;
+  string payloadEncoding = 6;
+  string payloadType = 7;
+  bytes payload = 8;
+}
+
+message Header {
+  string key = 1;
+  string value = 2;
+}
+
+// MARK: - Response (PushFrame.payload, gzip 解压后)
+message Response {
+  repeated Message messages = 1;
+  uint64 cursor = 2;
+  uint64 fetchInterval = 3;
+  uint64 id = 4;
+  uint64 result = 5;
+  string host = 6;
+}
+
+message Message {
+  string method = 1;
+  uint64 msgId = 2;
+  uint64 msgType = 3;
+  string payload = 4;   // 字符串,内容是 JSON 序列化后的具体消息体
+}
+
+// MARK: - 弹幕消息 (ChatMessage)
+message ChatMessage {
+  Common common = 1;
+  uint64 userId = 2;
+  int64 content = 3;
+  // content 实际是 base64 编码的字符串,需解码
+}
+
+// MARK: - 进场消息 (MemberMessage)
+message MemberMessage {
+  Common common = 1;
+  uint64 userId = 2;
+  int64 content = 3;
+  // 暂时不用
+}
+
+// MARK: - 点赞 (LikeMessage)
+message LikeMessage {
+  Common common = 1;
+  uint64 userId = 2;
+  int64 content = 3;
+  // 暂时不用
+}
+
+// MARK: - 在线人数 (RoomStatsMessage)
+message RoomStatsMessage {
+  Common common = 1;
+  int64 content = 3;  // content 是 JSON 字符串 {"display_short": ..., "display_long": ...}
+}
+
+// MARK: - GiftMessage (礼物)
+message GiftMessage {
+  Common common = 1;
+  uint64 userId = 2;
+  int64 content = 3;
+  // 暂时不用
+}
+
+message Common {
+  string method = 1;
+  uint64 msgId = 2;
+  uint64 roomId = 3;
+  uint64 createTime = 4;
+}

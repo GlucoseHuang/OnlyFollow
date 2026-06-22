@@ -84,7 +84,7 @@ struct PlaylistView: View {
         for index in offsets {
             modelContext.delete(target[index])
         }
-        try? modelContext.save()
+        modelContext.saveAndKickSync()
     }
 
     private func moveItems(from source: IndexSet, to destination: Int) {
@@ -92,8 +92,9 @@ struct PlaylistView: View {
         reordered.move(fromOffsets: source, toOffset: destination)
         for (idx, item) in reordered.enumerated() {
             item.order = idx
+            item.lastModifiedAt = .now
         }
-        try? modelContext.save()
+        modelContext.saveAndKickSync()
     }
 }
 

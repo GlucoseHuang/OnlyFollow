@@ -24,6 +24,10 @@ final class FollowedCreator: @unchecked Sendable {
     /// - true：之后的同步才算增量
     var hasCompletedInitialSync: Bool = false
 
+    /// 多设备同步用的最后修改时间。merge 时较新的覆盖较旧的。
+    /// 新插入时默认 = 创建时间；之后任意字段变动都要刷新这个值。
+    var lastModifiedAt: Date = Date()
+
     init(uid: String, platform: String, nickname: String, avatarURL: String, addedAt: Date = .now) {
         self.uid = uid
         self.platform = platform

@@ -7,6 +7,7 @@ Icon?
 # Xcode
 build/
 DerivedData/
+.derivedData/
 *.xcuserstate
 *.xcuserdatad/
 xcuserdata/
@@ -29,3 +30,6 @@ Carthage/Build/
 *.swp
 *.swo
 *~
+
+# Local research notes
+notes/

@@ -239,9 +239,44 @@ actor BilibiliAPIService {
         return videos
     }
 
+
+    // MARK: - UGC Season（合集）
+
+    /// 拉取一个合集下的所有视频
+    /// - 端点：/x/polymer/web-space/seasons_archives_list (官方推荐,需要 referer)
+    /// - 需要 WBI 签名（参考 fetchUserVideosWBI）
+    /// - 命中 -352 时上层应该降级到本地推荐（不要让用户体验卡住）
+    /// - 返回：合集元信息 + 视频列表(已按 B 站默认顺序排好,通常是按发布时间升序)
+    func fetchSeasonArchives(mid: String, seasonID: Int, pageNum: Int = 1, pageSize: Int = 30) async throws -> BilibiliSeasonArchivesResponse {
+        try await BilibiliSessionManager.shared.initialize()
+        let signed = BilibiliSessionManager.shared.signWBI(params: [
+            "mid": mid,
+            "season_id": String(seasonID),
+            "page_num": String(pageNum),
+            "page_size": String(pageSize),
+            "sort_reverse": "false",
+            "web_location": "333.999"
+        ])
+        var components = URLComponents(string: "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list")!
+        components.queryItems = signed.map { URLQueryItem(name: $0.key, value: $0.value) }
+        AppLogger.info("B站API: GET seasons_archives_list mid=\(mid) season_id=\(seasonID) page=\(pageNum)")
+        let data = try await bilibiliRequest(url: components.url!, referer: "https://space.bilibili.com/\(mid)")
+        let wrapper = try JSONDecoder().decode(BilibiliResponse<BilibiliSeasonArchivesResponse>.self, from: data)
+        if wrapper.code == -352 { throw APIError.antiCrawler }
+        if wrapper.code == -799 { throw APIError.rateLimited }
+        if wrapper.code == -404 { throw APIError.notFound }
+        guard let resp = wrapper.data else { throw APIError.parseError(wrapper.message ?? "no season data") }
+        AppLogger.info("B站API: 合集 season_id=\(seasonID) 返回 \(resp.archives.count) 个视频 (total=\(resp.meta?.total ?? resp.archives.count))")
+        return resp
+    }
+
     // MARK: - Other APIs (less frequent, no WBI needed)
 
-    func fetchVideoDetail(aid: String) async throws -> VideoItem {
+    /// 获取视频详情（raw, 含 pages[] / ugcSeason）
+    /// - 端点: /x/web-interface/view?aid=XXX (普通 GET, 不需要 WBI)
+    /// - 字段含义详见 SocialSisterYi/bilibili-API-collect docs/video/info.md
+    /// - 调用方需要 .toVideoItem() 才能得到 VideoItem；保留 raw 是为了让上层能拿 pages[]（分P）
+    func fetchVideoDetail(aid: String) async throws -> BilibiliVideoDetail {
         try await BilibiliSessionManager.shared.initialize()
         let url = URL(string: "https://api.bilibili.com/x/web-interface/view?aid=\(aid)")!
         let data = try await bilibiliRequest(url: url, referer: "https://www.bilibili.com")
@@ -249,7 +284,9 @@ actor BilibiliAPIService {
         if wrapper.code == -352 { throw APIError.antiCrawler }
         if wrapper.code == -799 { throw APIError.rateLimited }
         guard let detail = wrapper.data else { throw APIError.parseError(wrapper.message ?? "no data") }
-        return detail.toVideoItem()
+        // 把合集 ID + 分 P 数单独打一行, 便于快速判断
+        AppLogger.info("B站API: 视频详情 aid=\(detail.aid) ugcSeasonID=\(detail.ugcSeasonID.map(String.init) ?? "nil(无合集)") pages=\(detail.pages?.count ?? 0)")
+        return detail
     }
 
     func fetchLiveRoom(roomID: String) async throws -> LiveRoom {
@@ -263,15 +300,152 @@ actor BilibiliAPIService {
         return roomData.toLiveRoom()
     }
 
+    /// 获取直播弹幕 WebSocket 鉴权 token + host 列表
+    /// 浏览器流程（参考 bilibili-live-chat）：
+    /// 1. GET `room/v1/Room/room_init?id=xxx` 让服务端种 LIVE_BUVID
+    /// 2. GET `xlive/web-room/v1/index/getDanmuInfo?id=xxx&type=0&web_location=444.8&wts&w_rid` 带 cookie + WBI 签名
+    /// 2026 流程（lovelyyoshino）要求这个端点要 WBI 签名；浏览器可能因为在页面里拿了 __NEPTUNE_IS_MY_WAIFU__ 绕过，
+    /// 但我们直接调 API 就老老实实按 WBI 签一下
     func fetchDanmuInfo(roomID: Int) async throws -> BilibiliDanmuInfo {
         try await BilibiliSessionManager.shared.initialize()
-        let url = URL(string: "https://api.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id=\(roomID)")!
-        let data = try await bilibiliRequest(url: url, referer: "https://live.bilibili.com")
+        // 1) 预热拿 LIVE_BUVID（live 子域的 cookie）
+        let liveBuvid = (try? await fetchLiveRoomInit(roomID: roomID)) ?? ""
+        // 2) WBI 签名 + 拿 token + host_list
+        let signed = BilibiliSessionManager.shared.signWBI(params: [
+            "id": String(roomID),
+            "type": "0",
+            "web_location": "444.8"
+        ])
+        var components = URLComponents(string: "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo")!
+        components.queryItems = signed.map { URLQueryItem(name: $0.key, value: $0.value) }
+        // 自己发请求（不走 bilibiliRequest）：要把 LIVE_BUVID 加进 Cookie
+        let url = components.url!
+        var request = URLRequest(url: url)
+        request.setValue(BilibiliSessionManager.kDefaultUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("https://live.bilibili.com", forHTTPHeaderField: "Referer")
+        request.setValue("https://live.bilibili.com", forHTTPHeaderField: "Origin")
+        var cookies = BilibiliSessionManager.shared.cookieString
+        if !liveBuvid.isEmpty, !cookies.lowercased().contains("live_buvid=") {
+            cookies += cookies.isEmpty ? "LIVE_BUVID=\(liveBuvid)" : "; LIVE_BUVID=\(liveBuvid)"
+        }
+        if !cookies.isEmpty {
+            request.setValue(cookies, forHTTPHeaderField: "Cookie")
+        }
+        // 现代浏览器头
+        request.setValue("\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"", forHTTPHeaderField: "sec-ch-ua")
+        request.setValue("?0", forHTTPHeaderField: "sec-ch-ua-mobile")
+        request.setValue("\"macOS\"", forHTTPHeaderField: "sec-ch-ua-platform")
+        request.setValue("same-site", forHTTPHeaderField: "Sec-Fetch-Site")
+        request.setValue("cors", forHTTPHeaderField: "Sec-Fetch-Mode")
+        request.setValue("empty", forHTTPHeaderField: "Sec-Fetch-Dest")
+        request.setValue("zh-CN,zh;q=0.9", forHTTPHeaderField: "Accept-Language")
+        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        request.setValue("gzip, deflate, br", forHTTPHeaderField: "Accept-Encoding")
+
+        AppLogger.info("B站API: GET \(url.absoluteString) (WBI signed + LIVE_BUVID=\(liveBuvid.isEmpty ? "MISSING" : "ok"))")
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw APIError.httpError((response as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let code = json["code"] as? Int ?? 0
+            if code == -799 { throw APIError.rateLimited }
+            if code == -352 || code == 65530 {
+                let preview = String(data: data.prefix(500), encoding: .utf8) ?? "<binary>"
+                AppLogger.error("B站API: getDanmuInfo -352 body=\(preview)")
+                if let voucher = http.value(forHTTPHeaderField: "x-bili-gaia-vvoucher") {
+                    AppLogger.error("B站API: getDanmuInfo -352 x-bili-gaia-vvoucher=\(voucher)")
+                }
+                throw APIError.antiCrawler
+            }
+        }
         let wrapper = try JSONDecoder().decode(BilibiliResponse<BilibiliDanmuInfo>.self, from: data)
-        if wrapper.code == -352 { throw APIError.antiCrawler }
-        if wrapper.code == -799 { throw APIError.rateLimited }
         guard let info = wrapper.data else { throw APIError.parseError(wrapper.message ?? "no data") }
         return info
+    }
+
+    /// 获取 B 站直播播放地址（HLS m3u8）
+    /// 走 /xlive/web-room/v2/index/getRoomPlayInfo，按房间当前清晰度返回 HLS 流。
+    /// AVPlayer 原生支持 HLS，FLV 不支持，所以这里只挑 http_hls 协议 + ts/fmp4 容器 + AVC 编码。
+    /// - qn: 清晰度编号。0 = 服务端按该房间最高可用；10000=原画 / 400=蓝光 / 250=超清 / 150=高清 / 80=流畅
+    /// - Returns: m3u8 URL + 实际清晰度编号
+    /// 预热：先打 room/v1/Room/room_init 让服务端在 cookie 里种 LIVE_BUVID
+    /// 浏览器在打 getDanmuInfo 之前会先访问 live.bilibili.com 的某个端点把 LIVE_BUVID 拿到，
+    /// 否则 getDanmuInfo 会因为缺这个 live 子域的 cookie 而被风控（返回 -352）
+    /// 参考：https://github.com/SocialSisterYi/bilibili-API-collect/issues/1433
+    /// - Returns: 从 Set-Cookie 里解析出来的 LIVE_BUVID 值；解析不到就返回空串
+    func fetchLiveRoomInit(roomID: Int) async throws -> String {
+        try await BilibiliSessionManager.shared.initialize()
+        var components = URLComponents(string: "https://api.live.bilibili.com/room/v1/Room/room_init")!
+        components.queryItems = [URLQueryItem(name: "id", value: String(roomID))]
+        // 自己发请求（不走 bilibiliRequest 公共层）：需要直接拿 Set-Cookie 头
+        let url = components.url!
+        var request = URLRequest(url: url)
+        request.setValue(BilibiliSessionManager.kDefaultUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("https://live.bilibili.com", forHTTPHeaderField: "Referer")
+        request.setValue("https://live.bilibili.com", forHTTPHeaderField: "Origin")
+        let cookies = BilibiliSessionManager.shared.cookieString
+        if !cookies.isEmpty {
+            request.setValue(cookies, forHTTPHeaderField: "Cookie")
+        }
+        AppLogger.info("B站API: GET \(url.absoluteString) (room_init 预热拿 LIVE_BUVID)")
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.httpError(-1)
+        }
+        // 从 Set-Cookie 头里抠 LIVE_BUVID
+        // iOS URLSession 不会自动解析 Set-Cookie 到 http.cookies，要从 allHeaderFields 拿
+        if let setCookieList = http.allHeaderFields["Set-Cookie"] as? String {
+            for raw in setCookieList.components(separatedBy: ", ") {
+                // Set-Cookie 可能被合并到一个字符串，要逐个检查
+                if raw.contains("LIVE_BUVID=") {
+                    if let value = raw.components(separatedBy: ";").first?
+                        .replacingOccurrences(of: "LIVE_BUVID=", with: ""),
+                       !value.isEmpty {
+                        AppLogger.info("B站API: room_init 返回 LIVE_BUVID=\(value.prefix(16))...")
+                        return value
+                    }
+                }
+            }
+        }
+        AppLogger.info("B站API: room_init 未从 Set-Cookie 拿到 LIVE_BUVID, bodyLen=\(data.count)")
+        return ""
+    }
+
+    func fetchLiveStreamURL(roomID: Int, qn: Int = 0) async throws -> (url: String, quality: Int) {
+        try await BilibiliSessionManager.shared.initialize()
+        // 关键参数：
+        //   protocol=0,1 → http_stream, http_hls（只要 http_hls）
+        //   format=0,1,2 → flv, ts, fmp4（AVPlayer 不支持 flv，只挑 ts/fmp4）
+        //   codec=0,1    → AVC, HEVC（AVPlayer 不支持 HEVC，挑 AVC）
+        //   platform=web + qn=0 = 走 web 端默认清晰度
+        var components = URLComponents(string: "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo")!
+        components.queryItems = [
+            URLQueryItem(name: "room_id", value: "\(roomID)"),
+            URLQueryItem(name: "protocol", value: "0,1"),
+            URLQueryItem(name: "format", value: "0,1,2"),
+            URLQueryItem(name: "codec", value: "0,1"),
+            URLQueryItem(name: "qn", value: "\(qn)"),
+            URLQueryItem(name: "platform", value: "web"),
+            URLQueryItem(name: "ptype", value: "8"),
+        ]
+        let data = try await bilibiliRequest(url: components.url!, referer: "https://live.bilibili.com")
+        let wrapper = try JSONDecoder().decode(BilibiliResponse<BilibiliLivePlayInfoResponse>.self, from: data)
+        if wrapper.code == -352 { throw APIError.antiCrawler }
+        if wrapper.code == -799 { throw APIError.rateLimited }
+        guard let playData = wrapper.data else {
+            throw APIError.parseError(wrapper.message ?? "no play data")
+        }
+        // 房间未开播时 playurl_info.playurl 为 null
+        guard let playurl = playData.playurlInfo?.playurl else {
+            throw APIError.parseError("直播间未开播或 playurl_info 为空（roomID=\(roomID)）")
+        }
+        // 选第一条 HLS（http_hls）+ AVC 编码的流
+        guard let hlsURL = playurl.firstHLSStreamURL() else {
+            throw APIError.parseError("未找到 HLS 流（房间可能未开播）")
+        }
+        AppLogger.info("B站API: 直播流 roomID=\(roomID) qn=\(playData.playurlInfo?.currentQn ?? -1) url=\(hlsURL.prefix(120))...")
+        return (hlsURL, playData.playurlInfo?.currentQn ?? qn)
     }
 
     /// 获取视频实际播放 URL（带 ?xxx 鉴权参数的 CDN 链接）
@@ -446,6 +620,13 @@ actor BilibiliAPIService {
         request.setValue("zh-CN,zh;q=0.9", forHTTPHeaderField: "Accept-Language")
         request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
         request.setValue("gzip, deflate, br", forHTTPHeaderField: "Accept-Encoding")
+        // 现代浏览器头：让服务端更难识别为脚本请求
+        request.setValue("\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"", forHTTPHeaderField: "sec-ch-ua")
+        request.setValue("?0", forHTTPHeaderField: "sec-ch-ua-mobile")
+        request.setValue("\"macOS\"", forHTTPHeaderField: "sec-ch-ua-platform")
+        request.setValue("same-site", forHTTPHeaderField: "Sec-Fetch-Site")
+        request.setValue("cors", forHTTPHeaderField: "Sec-Fetch-Mode")
+        request.setValue("empty", forHTTPHeaderField: "Sec-Fetch-Dest")
         let cookies = BilibiliSessionManager.shared.cookieString
         if !cookies.isEmpty {
             request.setValue(cookies, forHTTPHeaderField: "Cookie")
@@ -480,7 +661,13 @@ actor BilibiliAPIService {
             if code == -352 {
                 // -352 不再 markSessionExpired：B 站对刚登录的会话会瞬时返回 -352，
                 // 实际是反爬挑战而非 token 失效，让上层重试
-                AppLogger.error("B站API: -352 风控")
+                // 打印响应体：v_voucher 文档说要从中读 voucher 字段确认触发的是 captcha 还是单纯风控
+                let preview = String(data: data.prefix(500), encoding: .utf8) ?? "<binary>"
+                AppLogger.error("B站API: -352 风控 body=\(preview)")
+                // 也把响应头里的 x-bili-gaia-vvoucher 一并打出来
+                if let voucher = httpResponse.value(forHTTPHeaderField: "x-bili-gaia-vvoucher") {
+                    AppLogger.error("B站API: -352 x-bili-gaia-vvoucher=\(voucher)")
+                }
                 throw APIError.antiCrawler
             }
         }

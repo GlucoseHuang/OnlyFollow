@@ -163,8 +163,9 @@ struct SearchResultRow: View {
     @Environment(\.modelContext) private var modelContext
 
     var body: some View {
-        NavigationLink {
-            VideoPlayerView(video: result.video, modelContext: modelContext)
+        Button {
+            // 走 UIKit 全屏 present，绕开 NavigationLink push 的非全屏问题
+            PlayerPresenter.present(result.video, modelContext: modelContext)
         } label: {
             HStack(alignment: .top, spacing: 12) {
                 AsyncImage(url: URL(string: result.video.coverURL)) { img in

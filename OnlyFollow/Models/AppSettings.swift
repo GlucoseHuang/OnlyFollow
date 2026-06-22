@@ -44,6 +44,100 @@ enum AppSettings {
         set { defaults.set(newValue, forKey: "bilibili_logged_name") }
     }
 
+    // MARK: - 「播完下一个」推荐
+
+    /// 是否启用 B 站 UGC 合集自动连播（路径 1）
+    /// - true：当前视频在合集中时, 播完自动跳到合集下一个
+    /// - false：关闭, 不论合集是否存在, 都不连播
+    static var seasonAutoplayEnabled: Bool {
+        get { defaults.object(forKey: "rec.seasonAutoplay") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "rec.seasonAutoplay") }
+    }
+
+    /// 本地推荐模式:路径 2 默认走哪个
+    enum LocalRecommendMode: String, CaseIterable {
+        case vector   // 本地向量(默认, 离线可用, 几乎免费)
+        case deepseek // DeepSeek LLM(用户主动点才用; 不入默认连播链路)
+    }
+
+    /// 「合集自动补全」开关: 用户播放合集视频时, 是否自动触发单合集第一页的 backfill
+    /// - 默认开(用户无感, 30s 内合集列表自动变长)
+    /// - 关掉后只能手动点合集 sheet 顶部按钮 / 设置里的全量补全
+    static var seasonAutoBackfillEnabled: Bool {
+        get { defaults.object(forKey: "rec.seasonAutoBackfill") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "rec.seasonAutoBackfill") }
+    }
+
+    /// "AI 智能推荐"总开关（路径 2 整体）
+    /// - 关掉后, 不论本地还是 DeepSeek, 都不在播完后弹推荐视频页
+    /// - 合集逻辑（路径 1）独立于这个开关
+    static var aiRecommendEnabled: Bool {
+        get { defaults.object(forKey: "rec.aiEnabled") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "rec.aiEnabled") }
+    }
+
+    static var localRecommendMode: LocalRecommendMode {
+        get { LocalRecommendMode(rawValue: defaults.string(forKey: "rec.localMode") ?? "") ?? .vector }
+        set { defaults.set(newValue.rawValue, forKey: "rec.localMode") }
+    }
+
+    /// 推荐结果数量（播放结束后的封面网格行数）
+    /// 范围 6-12, 默认 8
+    static var recommendCount: Int {
+        get {
+            let v = defaults.integer(forKey: "rec.count")
+            return (6...12).contains(v) ? v : 8
+        }
+        set { defaults.set(max(6, min(12, newValue)), forKey: "rec.count") }
+    }
+
+    // MARK: - Embedding (本地向量)
+
+    /// 阿里云百炼 DashScope 兼容模式（默认）, 也可换 OpenAI / 其他兼容服务
+    static var embeddingBaseURL: String {
+        get { defaults.string(forKey: "emb.baseURL") ?? "https://dashscope.aliyuncs.com/compatible-mode/v1" }
+        set { defaults.set(newValue, forKey: "emb.baseURL") }
+    }
+
+    static var embeddingAPIKey: String {
+        get { defaults.string(forKey: "emb.apiKey") ?? "" }
+        set { defaults.set(newValue, forKey: "emb.apiKey") }
+    }
+
+    static var hasEmbeddingAPIKey: Bool { !embeddingAPIKey.isEmpty }
+
+    /// 模型名;目前固定 text-embedding-v4 1024 维
+    static var embeddingModel: String {
+        get { defaults.string(forKey: "emb.model") ?? "text-embedding-v4" }
+        set { defaults.set(newValue, forKey: "emb.model") }
+    }
+
+    static var embeddingDimensions: Int {
+        get { defaults.integer(forKey: "emb.dims") == 0 ? 1024 : defaults.integer(forKey: "emb.dims") }
+        set { defaults.set(newValue, forKey: "emb.dims") }
+    }
+
+    // MARK: - DeepSeek (LLM 推荐备选)
+
+    static var deepseekBaseURL: String {
+        get { defaults.string(forKey: "ds.baseURL") ?? "https://api.deepseek.com/v1" }
+        set { defaults.set(newValue, forKey: "ds.baseURL") }
+    }
+
+    static var deepseekAPIKey: String {
+        get { defaults.string(forKey: "ds.apiKey") ?? "" }
+        set { defaults.set(newValue, forKey: "ds.apiKey") }
+    }
+
+    static var hasDeepSeekAPIKey: Bool { !deepseekAPIKey.isEmpty }
+
+    /// 默认 deepseek-v4-flash(便宜 + 速度快, 推荐任务够用)
+    /// 用户在 Settings 改成 deepseek-v4-pro 也能用
+    static var deepseekModel: String {
+        get { defaults.string(forKey: "ds.model") ?? "deepseek-v4-flash" }
+        set { defaults.set(newValue, forKey: "ds.model") }
+    }
+
     // MARK: - 抖音 Cookie
 
     static var douyinCookie: String {

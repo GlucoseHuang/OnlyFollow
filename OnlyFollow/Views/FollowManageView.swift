@@ -28,6 +28,7 @@ struct FollowManageView: View {
                 .swipeActions(edge: .trailing) {
                     Button(role: .destructive) {
                         modelContext.delete(creator)
+                        modelContext.saveAndKickSync()
                     } label: {
                         Label("删除", systemImage: "trash")
                     }

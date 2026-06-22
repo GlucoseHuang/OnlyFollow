@@ -9,9 +9,8 @@ import SwiftData
 /// 4. 提供批量拉取状态读写
 ///
 /// 线程模型：
-/// - 所有方法都在 @MainActor 上调用（因为 SwiftData ModelContext 必须 MainActor 安全）
-/// - 内部使用入参传入的 ModelContext，不缓存，避免线程切换时的歧义
-@MainActor
+/// - 故意不在 @MainActor。upsert 写 30 条记录很快,但和 SwiftData save 一起放在主线程上会卡住 UI
+/// - 调用方用 Task.detached + 后台 ModelContext 触发;后台 save 完后 SwiftData 自动 propagate 到主 context
 enum VideoCatalog {
     // MARK: - 写入
 
@@ -49,9 +48,14 @@ enum VideoCatalog {
                 r.authorName = v.authorName
                 r.authorAvatar = v.authorAvatar
                 r.lastRefreshedAt = now
+                r.lastModifiedAt = now
                 let tok = precomputeTokens(title: v.title, author: v.authorName)
                 r.titleTokens = tok.titleTokens
                 r.authorTokens = tok.authorTokens
+                // 合集 ID: sync 阶段拿不到(fetchVideoDetail 才有), 但播放过的视频会带过来
+                // 用 ?? nil 保护 nil 值不被覆盖(已有但新值是 nil 的情况)
+                if let sid = v.ugcSeasonID { r.ugcSeasonID = sid }
+                if let st = v.ugcSeasonTitle { r.ugcSeasonTitle = st }
             } else {
                 let tok = precomputeTokens(title: v.title, author: v.authorName)
                 let record = VideoRecord(
@@ -72,7 +76,9 @@ enum VideoCatalog {
                     firstSeenAt: now,
                     lastRefreshedAt: now,
                     titleTokens: tok.titleTokens,
-                    authorTokens: tok.authorTokens
+                    authorTokens: tok.authorTokens,
+                    ugcSeasonID: v.ugcSeasonID,
+                    ugcSeasonTitle: v.ugcSeasonTitle
                 )
                 context.insert(record)
                 // 先记下来，但只有 save 成功才会真正算作新增
@@ -215,7 +221,13 @@ enum VideoCatalog {
         if let total {
             creator.bulkFetchTotal = total
         }
+        // 多设备同步：批量拉取进度也是"修改"，刷新 lastModifiedAt
+        creator.lastModifiedAt = .now
         try? context.save()
+        // kickUpload 是 @MainActor,从 nonisolated 的 updateBulkFetchState 调要异步 dispatch
+        Task { @MainActor in
+            SyncCoordinator.shared.kickUpload()
+        }
     }
 
     struct BulkFetchState {

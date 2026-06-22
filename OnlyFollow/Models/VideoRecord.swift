@@ -39,6 +39,15 @@ final class VideoRecord {
     /// 预计算的 UP 主名分词（空格分隔）
     var authorTokens: String
 
+    /// B 站 UGC 合集 ID. sync 流程拿不到(列表 API 不返回), 只有播放过该视频
+    /// (`fetchVideoDetail`) 之后才填. nil = 该视频本地还没拿到合集 ID, 不参与合集列表查询.
+    var ugcSeasonID: Int?
+    /// B 站 UGC 合集标题. 跟 ugcSeasonID 一起出现, 给合集列表头部用.
+    var ugcSeasonTitle: String?
+
+    /// 多设备同步用的最后修改时间。merge 时较新的覆盖较旧的；基本与 lastRefreshedAt 同步刷新。
+    var lastModifiedAt: Date = Date()
+
     init(
         aid: Int,
         platform: String,
@@ -57,7 +66,9 @@ final class VideoRecord {
         firstSeenAt: Date = .now,
         lastRefreshedAt: Date = .now,
         titleTokens: String = "",
-        authorTokens: String = ""
+        authorTokens: String = "",
+        ugcSeasonID: Int? = nil,
+        ugcSeasonTitle: String? = nil
     ) {
         self.aid = aid
         self.platform = platform
@@ -77,6 +88,8 @@ final class VideoRecord {
         self.lastRefreshedAt = lastRefreshedAt
         self.titleTokens = titleTokens
         self.authorTokens = authorTokens
+        self.ugcSeasonID = ugcSeasonID
+        self.ugcSeasonTitle = ugcSeasonTitle
     }
 
     /// 转为 VideoItem 给 VideoPlayerView 使用
@@ -99,7 +112,9 @@ final class VideoRecord {
             authorUID: authorUID,
             authorName: authorName,
             authorAvatar: authorAvatar,
-            platform: platform
+            platform: platform,
+            ugcSeasonID: ugcSeasonID,
+            ugcSeasonTitle: ugcSeasonTitle
         )
     }
 }
