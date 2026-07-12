@@ -56,10 +56,15 @@ struct VideoSearchView: View {
     // MARK: - 提示状态
 
     /// 批量拉取进度：(done, total)。nil 表示没有 B 站 creator。
+    /// 修复 Bug 1: 不仅看 completedAt 状态,还要看 cache 视频数 == total 才算"真正完成"
     private var bulkFetchProgress: (done: Int, total: Int)? {
         let bili = creators.filter { $0.platform == "bilibili" }
         guard !bili.isEmpty else { return nil }
-        let done = bili.filter { $0.bulkFetchCompletedAt != nil }.count
+        let done = bili.filter { c in
+            if c.bulkFetchCompletedAt != nil { return true }
+            let cached = VideoCache.shared.videos(for: c.uid)?.count ?? 0
+            return c.bulkFetchTotal > 0 && cached >= c.bulkFetchTotal
+        }.count
         return (done, bili.count)
     }
 

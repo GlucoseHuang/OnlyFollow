@@ -25,6 +25,9 @@ final class DouyinSessionManager {
         isInitialized = true
         AppLogger.info("DouyinSessionManager: init")
         DouyinSigner.shared.ensureReady()
+        // Webcast 弹幕签名器 (独立 WKWebView + sign.js) 同步启动
+        // 两者并行加载, 进直播间时已基本就绪
+        DouyinWebcastSigner.shared.ensureReady()
     }
 
     /// 拼好的 cookie header 值

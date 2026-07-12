@@ -51,6 +51,19 @@ enum SearchTokenizer {
         tokens(for: query)
     }
 
+    /// 一次性分词 + 去重 + 空格拼接,得到可存储的"预计算 token 串"
+    /// - 用于 VideoRecord 入库时写到 titleTokens / authorTokens 字段
+    /// - 也用于远端 DTO 缺失 token 时,merge 进本地时现场算出再写回(lazy-fill)
+    static func tokenString(for text: String) -> String {
+        var seen = Set<String>()
+        var unique: [String] = []
+        for t in tokens(for: text) where !seen.contains(t) {
+            seen.insert(t)
+            unique.append(t)
+        }
+        return unique.joined(separator: " ")
+    }
+
     /// 计算一条 VideoRecord 对应搜索 query 的相关分
     /// 逻辑：每个 query token 在"title-tokens"和"author-tokens"里各加分
     ///   - 标题命中：每个 token +10
@@ -88,11 +101,21 @@ enum SearchTokenizer {
     private static func isCJK(_ scalar: Character) -> Bool {
         // 覆盖：中日韩统一表意文字 + 平假名 + 片假名 + 韩文
         guard let v = scalar.unicodeScalars.first?.value else { return false }
-        return (0x4E00...0x9FFF).contains(v)        // CJK Unified Ideographs
-            || (0x3040...0x309F).contains(v)         // Hiragana
-            || (0x30A0...0x30FF).contains(v)         // Katakana
-            || (0xAC00...0xD7AF).contains(v)         // Hangul Syllables
-            || (0x3400...0x4DBF).contains(v)         // CJK Extension A
-            || (0xFF00...0xFFEF).contains(v)         // Halfwidth/Fullwidth Forms
+        // 核心 CJK 范围
+        if (0x4E00...0x9FFF).contains(v)        // CJK Unified Ideographs
+            || (0x3040...0x309F).contains(v)    // Hiragana
+            || (0x30A0...0x30FF).contains(v)    // Katakana
+            || (0xAC00...0xD7AF).contains(v)    // Hangul Syllables
+            || (0x3400...0x4DBF).contains(v) {  // CJK Extension A
+            return true
+        }
+        // Halfwidth/Fullwidth Forms (0xFF00-0xFFEF):
+        // 只保留字母/数字/假名,排除全角标点("！" "：" "？" 等)
+        if (0xFF66...0xFF9F).contains(v) { return true }  // Halfwidth Katakana
+        if (0xFFA0...0xFFDC).contains(v) { return true }  // Halfwidth Hangul
+        if (0xFF10...0xFF19).contains(v) { return true }  // Fullwidth Digits
+        if (0xFF21...0xFF3A).contains(v) { return true }  // Fullwidth Uppercase
+        if (0xFF41...0xFF5A).contains(v) { return true }  // Fullwidth Lowercase
+        return false
     }
 }

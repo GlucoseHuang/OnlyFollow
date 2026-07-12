@@ -195,7 +195,11 @@ struct VideoDTO: Codable, Sendable {
     var bvid: String
     var title: String
     var coverURL: String
-    var webURL: String
+    /// 已废弃:本字段不再写入新 snapshot; 老 snapshot 还能解码
+    /// - 播放页需要的 webURL 由 `https://www.bilibili.com/video/av{aid}` 现场拼
+    /// - 这里保留是给老数据 backward-compat 用
+    @available(*, deprecated)
+    var webURL: String?
     var duration: Int
     var publishTime: Date
     var viewCount: Int
@@ -206,13 +210,103 @@ struct VideoDTO: Codable, Sendable {
     var authorAvatar: String
     var firstSeenAt: Date
     var lastRefreshedAt: Date
-    var titleTokens: String
-    var authorTokens: String
+    /// 已废弃:本字段不再写入新 snapshot; 老 snapshot 还能解码
+    /// - 搜索所需的 tokens 由 SyncMerger 在 merge 时根据 title/authorName 现场算(lazy-fill)
+    @available(*, deprecated)
+    var titleTokens: String?
+    /// 已废弃:本字段不再写入新 snapshot
+    @available(*, deprecated)
+    var authorTokens: String?
     /// B 站 UGC 合集 ID(可选). v2 字段; 老 snapshot 不带时解码为 nil, 跟本地现有的 nil 兼容.
     var ugcSeasonID: Int?
     /// B 站 UGC 合集标题(可选). v2 字段.
     var ugcSeasonTitle: String?
     var lastModifiedAt: Date
+
+    /// 显式 memberwise init:自定义 decoder 之后 Swift 不再自动合成
+    /// - 三个已废弃字段都给默认值 nil,让 SyncExporter 不必显式传
+    init(
+        aid: Int,
+        platform: String,
+        bvid: String,
+        title: String,
+        coverURL: String,
+        webURL: String? = nil,
+        duration: Int,
+        publishTime: Date,
+        viewCount: Int,
+        danmakuCount: Int,
+        commentCount: Int,
+        authorUID: String,
+        authorName: String,
+        authorAvatar: String,
+        firstSeenAt: Date,
+        lastRefreshedAt: Date,
+        titleTokens: String? = nil,
+        authorTokens: String? = nil,
+        ugcSeasonID: Int? = nil,
+        ugcSeasonTitle: String? = nil,
+        lastModifiedAt: Date
+    ) {
+        self.aid = aid
+        self.platform = platform
+        self.bvid = bvid
+        self.title = title
+        self.coverURL = coverURL
+        self.webURL = webURL
+        self.duration = duration
+        self.publishTime = publishTime
+        self.viewCount = viewCount
+        self.danmakuCount = danmakuCount
+        self.commentCount = commentCount
+        self.authorUID = authorUID
+        self.authorName = authorName
+        self.authorAvatar = authorAvatar
+        self.firstSeenAt = firstSeenAt
+        self.lastRefreshedAt = lastRefreshedAt
+        self.titleTokens = titleTokens
+        self.authorTokens = authorTokens
+        self.ugcSeasonID = ugcSeasonID
+        self.ugcSeasonTitle = ugcSeasonTitle
+        self.lastModifiedAt = lastModifiedAt
+    }
+
+    /// 自定义 decoder:三个已废弃字段(titleTokens / authorTokens / webURL)用 decodeIfPresent 兼容老 snapshot
+    /// - 老 snapshot 里这三个字段是 String(非可选); decodeIfPresent 在字段缺失时返回 nil,字段存在但为 null 也返回 nil
+    /// - 新 snapshot 不写这三个字段; Codable 的 KeyedDecodingContainer.decodeIfPresent 直接走 nil 分支
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        aid = try c.decode(Int.self, forKey: .aid)
+        platform = try c.decode(String.self, forKey: .platform)
+        bvid = try c.decode(String.self, forKey: .bvid)
+        title = try c.decode(String.self, forKey: .title)
+        coverURL = try c.decode(String.self, forKey: .coverURL)
+        webURL = try c.decodeIfPresent(String.self, forKey: .webURL)
+        duration = try c.decode(Int.self, forKey: .duration)
+        publishTime = try c.decode(Date.self, forKey: .publishTime)
+        viewCount = try c.decode(Int.self, forKey: .viewCount)
+        danmakuCount = try c.decode(Int.self, forKey: .danmakuCount)
+        commentCount = try c.decode(Int.self, forKey: .commentCount)
+        authorUID = try c.decode(String.self, forKey: .authorUID)
+        authorName = try c.decode(String.self, forKey: .authorName)
+        authorAvatar = try c.decode(String.self, forKey: .authorAvatar)
+        firstSeenAt = try c.decode(Date.self, forKey: .firstSeenAt)
+        lastRefreshedAt = try c.decode(Date.self, forKey: .lastRefreshedAt)
+        titleTokens = try c.decodeIfPresent(String.self, forKey: .titleTokens)
+        authorTokens = try c.decodeIfPresent(String.self, forKey: .authorTokens)
+        ugcSeasonID = try c.decodeIfPresent(Int.self, forKey: .ugcSeasonID)
+        ugcSeasonTitle = try c.decodeIfPresent(String.self, forKey: .ugcSeasonTitle)
+        lastModifiedAt = try c.decode(Date.self, forKey: .lastModifiedAt)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case aid, platform, bvid, title, coverURL, webURL
+        case duration, publishTime, viewCount, danmakuCount, commentCount
+        case authorUID, authorName, authorAvatar
+        case firstSeenAt, lastRefreshedAt
+        case titleTokens, authorTokens
+        case ugcSeasonID, ugcSeasonTitle, lastModifiedAt
+    }
 }
 
 
@@ -233,6 +327,7 @@ struct LiveHistoryDTO: Codable, Sendable {
 extension VideoDTO {
     /// 转换为 VideoItem,用于填充 VideoCache 给首页 / 详情页展示
     /// - cid/playURL 不在 DTO 里(播放页另行拉),保持空字符串即可
+    /// - webURL 不再存在 DTO 里,根据 aid 现场拼(B 站: https://www.bilibili.com/video/av{aid})
     func toVideoItem() -> VideoItem {
         VideoItem(
             id: String(aid),
@@ -242,7 +337,7 @@ extension VideoDTO {
             title: title,
             coverURL: coverURL,
             playURL: "",
-            webURL: webURL,
+            webURL: "https://www.bilibili.com/video/av\(aid)",
             duration: duration,
             publishTime: publishTime,
             viewCount: viewCount,

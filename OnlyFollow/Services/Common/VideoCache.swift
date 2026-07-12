@@ -19,8 +19,37 @@ final class VideoCache: ObservableObject {
         return docs.appendingPathComponent("video_cache.json")
     }()
 
+    /// 串行后台队列：JSON 编码 + 原子写磁盘
+    /// - 串行避免并发写同一个文件
+    /// - utility QoS 不抢占主线程 CPU
+    private let persistQueue = DispatchQueue(label: "com.onlyfollow.VideoCache.persist", qos: .utility)
+
     private init() {
-        loadFromDisk()
+        // 启动慢修复: 之前在 init 同步 loadFromDisk, 11MB JSON 解码阻塞主线程 100-500ms
+        //   App 启动时 VideoCache.shared = VideoCache() 是第一次访问, 直接卡白屏
+        // 修法: init 立刻返回, load 在后台 Task 里跑, 完成后跳回主线程更新 @Published
+        //   期间 videosByCreator 为空, 视图显示「暂无数据」, 不影响首屏其他 UI
+        loadFromDiskAsync()
+    }
+
+    private func loadFromDiskAsync() {
+        let url = cacheFileURL
+        Task.detached(priority: .userInitiated) {
+            // 后台线程: 读文件 + JSON 解码 (CPU/IO bound, 不在主线程跑)
+            guard let data = try? Data(contentsOf: url) else { return }
+            guard let shape = try? JSONDecoder().decode(PersistShape.self, from: data) else { return }
+
+            // 跳回主线程: 写 @Published (必须在 MainActor)
+            await MainActor.run {
+                self.videosByCreator = shape.videos
+                self.liveRoomByCreator = shape.liveRooms
+                let defaultDate = Date().addingTimeInterval(-3600)
+                for key in shape.videos.keys {
+                    self.lastRefreshedAt[key] = defaultDate
+                }
+                AppLogger.info("VideoCache: loaded \(shape.videos.count) creators from disk")
+            }
+        }
     }
 
     // MARK: - 读取
@@ -107,8 +136,22 @@ final class VideoCache: ObservableObject {
     }
 
     private func persistToDisk() {
+        // 设计问题修复：之前 persistToDisk 在 @MainActor 上同步做
+        //   JSONEncoder().encode(11MB) + atomic write, 单次 100-500ms
+        //   bulk fetch 11 个 UP 主触发 11 次 → 主线程累计被卡 1-5 秒
+        //   表现为「过几秒卡一下」+ 按钮无响应 + 弹幕冻结
+        //
+        // 修法: 值类型快照在主线程做（COW 引用赋值 O(1), 跟原来一样快),
+        //       JSON 编码 + atomic write 丢到后台串行队列,
+        //       主线程立刻返回, 不再被磁盘 I/O 阻塞。
+        //
+        // 线程安全: PersistShape 是值类型, 字典的 COW 语义保证
+        //   `videosByCreator` 引用赋值是原子操作, 后台拿到独立副本。
+        //   后续若主线程修改 videosByCreator (新引用), 后台继续用它自己的快照, 不冲突。
         let shape = PersistShape(videos: videosByCreator, liveRooms: liveRoomByCreator)
-        guard let data = try? JSONEncoder().encode(shape) else { return }
-        try? data.write(to: cacheFileURL, options: .atomic)
+        persistQueue.async { [cacheFileURL] in
+            guard let data = try? JSONEncoder().encode(shape) else { return }
+            try? data.write(to: cacheFileURL, options: .atomic)
+        }
     }
 }

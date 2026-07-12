@@ -27,6 +27,10 @@ struct DouyinUserInfo: Sendable {
         /// (macOS AVPlayer 原生不支持 FLV,HLS 优先)
         let flvURL: String?
         let hlsURL: String?
+        /// 抖音专属: 每个画质对应的 HLS m3u8 URL。
+        /// key 是 sdk_key (ld/sd/hd/uhd/origin), value 是 m3u8 完整 URL。
+        /// 画质选择 UI 用这个。只填该房间实际可用的画质(空 HLS 不填)。
+        var hlsURLsByQuality: [String: String] = [:]
         let viewerCount: Int?
         /// 0 = 未直播, 2 = 直播中, 4 = 录像回放
         let liveStatus: Int?
@@ -78,6 +82,7 @@ struct DouyinUserInfo: Sendable {
             // 绕过 webcast/room/web/enter 接口 (对部分房间返回 4001038 "该内容暂时无法查看")
             var flvURL: String? = nil
             var hlsURL: String? = nil
+            var hlsURLsByQuality: [String: String] = [:]
             var viewerCountFromRoomData: Int? = nil
             var statusFromRoomData: Int? = nil
             if let rdStr = userDict["room_data"] as? String,
@@ -85,34 +90,86 @@ struct DouyinUserInfo: Sendable {
                let rd = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 statusFromRoomData = rd["status"] as? Int
                 viewerCountFromRoomData = rd["user_count"] as? Int
+
+                // 实际数据(2026-06 抖音 web 端真实协议):
+                // stream_url 下同时有 flv_pull_url (dict, 4 个画质) 和 live_core_sdk_data.pull_data.stream_data
+                // stream_data 是个 JSON string, 内含 data["<quality>"].main.hls (m3u8) / main.flv
+                // hls 字段是真正的 HLS URL,AVPlayer 原生支持,这是首选
+                // flv 字段给的是 FLV,macOS 不支持,作为兜底
                 if let stream = rd["stream_url"] as? [String: Any] {
-                    // flv_pull_url 是个 dict, key 是清晰度 (FULL_HD1 / HD1 / SD1 / SD2)
+                    // 1) flv_pull_url: 顶层 dict, key 是 FULL_HD1/HD1/SD1/SD2 (按画质选择)
                     if let flvDict = stream["flv_pull_url"] as? [String: String] {
-                        // 优先最高画质
                         flvURL = flvDict["FULL_HD1"] ?? flvDict["HD1"] ?? flvDict["SD1"] ?? flvDict["SD2"] ?? flvDict.values.first
                     } else if let flvStr = stream["flv_pull_url"] as? String {
                         flvURL = flvStr
                     }
-                    if let hlsStr = stream["hls_pull_url"] as? String {
+
+                    // 2) 顶层 hls_pull_url 兼容 (老接口历史遗留)
+                    if let hlsStr = stream["hls_pull_url"] as? String, !hlsStr.isEmpty {
                         hlsURL = hlsStr
+                    } else if let hlsDict = stream["hls_pull_url"] as? [String: String] {
+                        hlsURL = hlsDict["FULL_HD1"] ?? hlsDict["HD1"] ?? hlsDict["SD1"] ?? hlsDict["SD2"] ?? hlsDict.values.first
                     }
+
+                    // 3) live_core_sdk_data.pull_data.stream_data: 主路径 (实测 2026-06)
+                    // 结构: {"options":{"default_quality":{"sdk_key":"hd"},"qualities":[...]},
+                    //        "data":{"hd":{"main":{"hls":"...m3u8","flv":"...flv"}},...}}
+                    if let lcsd = stream["live_core_sdk_data"] as? [String: Any],
+                       let pullData = lcsd["pull_data"] as? [String: Any],
+                       let streamDataStr = pullData["stream_data"] as? String,
+                       let sd = streamDataStr.data(using: .utf8),
+                       let sdObj = try? JSONSerialization.jsonObject(with: sd) as? [String: Any] {
+                        let defaultKey: String = {
+                            if let opts = sdObj["options"] as? [String: Any],
+                               let dq = opts["default_quality"] as? [String: Any],
+                               let key = dq["sdk_key"] as? String, !key.isEmpty {
+                                return key
+                            }
+                            return "hd"
+                        }()
+                        if let data = sdObj["data"] as? [String: Any] {
+                            // 默认画质
+                            if let quality = data[defaultKey] as? [String: Any],
+                               let main = quality["main"] as? [String: Any],
+                               let hls = main["hls"] as? String, !hls.isEmpty {
+                                hlsURL = hls
+                                AppLogger.info("DouyinModels: 抖音 HLS (来自 stream_data) 画质=\(defaultKey) host=\(URL(string: hls)?.host ?? "nil")")
+                            }
+                            // 扫所有画质,把有 hls 的全收集到 byQuality dict (画质选择 UI 用)
+                            for key in ["origin", "uhd", "hd", "sd", "ld"] {
+                                if let q = data[key] as? [String: Any],
+                                   let main = q["main"] as? [String: Any],
+                                   let hls = main["hls"] as? String, !hls.isEmpty,
+                                   hlsURLsByQuality[key] == nil {
+                                    hlsURLsByQuality[key] = hls
+                                }
+                            }
+                            AppLogger.info("DouyinModels: 抖音可用画质 = \(hlsURLsByQuality.keys.sorted().joined(separator: ","))")
+                        }
                 }
             }
 
-            return LiveRoomInfo(
+            let qualityMap = hlsURLsByQuality
+            let liveRoomInfo = LiveRoomInfo(
                 roomId: roomId,
                 title: liveRoomSub?["title"] as? String,
                 coverURL: (coverSub?["url_list"] as? [String])?.first,
-                // 优先用 room_data 里的 stream_url (新版 API), 兜底用 live_room 子对象
-                streamURL: flvURL ?? hlsURL ?? (streamSub?["flv_pull_url"] as? String) ?? (streamSub?["hls_pull_url"] as? String),
+                // HLS 优先 (AVPlayer 原生支持), FLV 作为兜底
+                streamURL: hlsURL ?? flvURL ?? (streamSub?["hls_pull_url"] as? String) ?? (streamSub?["flv_pull_url"] as? String),
                 flvURL: flvURL ?? (streamSub?["flv_pull_url"] as? String),
                 hlsURL: hlsURL ?? (streamSub?["hls_pull_url"] as? String),
+                hlsURLsByQuality: qualityMap,
                 viewerCount: viewerCountFromRoomData,
                 // room_data 的 status 更准确 (2=直播中), 优先用它
                 liveStatus: statusFromRoomData ?? liveStatus
             )
+            AppLogger.info("DouyinModels: 最终 LiveRoomInfo.hlsURLsByQuality=\(liveRoomInfo.hlsURLsByQuality.keys.sorted().joined(separator: ","))")
+            return liveRoomInfo
         }
+        // 没有 room_data (用户没开播或接口未返回), 返回 nil
+        return nil
     }
+}
 
     /// 从 JSON dict 安全解析（不抛错）
     static func from(_ dict: [String: Any]) -> DouyinUserInfo {
@@ -346,23 +403,8 @@ struct DouyinVideoItem: Sendable {
             return nil
         }()
 
-        // 一次性把首条视频的关键字段结构 dump 出来,辅助定位问题
-        if !DouyinModelsDebug.dumpedOnce {
-            DouyinModelsDebug.dumpedOnce = true
-            let videoKeys = videoSub.keys.sorted().joined(separator: ",")
-            let playAddrKeys = (videoSub["play_addr"] as? [String: Any])?.keys.sorted().joined(separator: ",") ?? "nil"
-            let playAddrFirst = (videoSub["play_addr"] as? [String: Any])?["url_list"] as? [String]
-            // bit_rate 数组的每个 gear,供画质选择诊断
-            let gears: String = (videoSub["bit_rate"] as? [[String: Any]] ?? []).map { e in
-                let g = e["gear_name"] as? String ?? "?"
-                let b = e["bit_rate"] as? Int ?? Int(e["bit_rate"] as? String ?? "") ?? 0
-                let p = (e["play_addr"] as? [String: Any])?["url_list"] as? [String] ?? []
-                let isW = (p.first ?? "").contains("playwm") ? "wm" : "ok"
-                return "\(g)(\(b/1000)kbps,\(isW))"
-            }.joined(separator: ",") ?? "nil"
-            let chosenBest = Self.highestQualityPlayURL(from: dict)
-            AppLogger.info("DouyinModels: 首条 aweme 结构, topKeys=\(dict.keys.sorted().joined(separator: ",")), videoKeys=\(videoKeys), playAddrKeys=\(playAddrKeys), playAddrFirst=\(playAddrFirst?.first?.prefix(60) ?? "nil"), bit_rate gears=\(gears), chosenBest=\(chosenBest.map { "\($0.gearName ?? "?")(\($0.bitrate/1000)kbps)" } ?? "nil"), coverURL=\(cover?.prefix(60) ?? "nil"), playURL=\(playURL?.prefix(60) ?? "nil")")
-        }
+        // 一次性把首条视频的关键字段结构 dump 出来,辅助定位问题 (2026-06 已删, 全部结构在 AppLogger.info 已知)
+        // [已废弃] 之前 AI 留下, 删了避免编译错
 
         return DouyinVideoItem(
             awemeId: dict["aweme_id"] as? String,
@@ -508,7 +550,9 @@ struct DouyinLiveRoomResponse: Sendable {
             let stream = streamDict.map {
                 DouyinStreamURL(
                     flvPullURL: $0["flv_pull_url"] as? String,
+                    flvPullURLMap: $0["flv_pull_url"] as? [String: String],
                     hlsPullURL: $0["hls_pull_url"] as? String,
+                    hlsPullUrlMap: $0["hls_pull_url_map"] as? [String: String],
                     rtmpPullURL: $0["rtmp_pull_url"] as? String
                 )
             }
@@ -548,14 +592,12 @@ struct DouyinLiveRoomResponse: Sendable {
 
 struct DouyinStreamURL: Sendable {
     let flvPullURL: String?
+    let flvPullURLMap: [String: String]?
     let hlsPullURL: String?
+    let hlsPullUrlMap: [String: String]?
     let rtmpPullURL: String?
 }
 
 
-// MARK: - 调试辅助
-
-/// 一次性 dump 控制,确保首条视频只 dump 一次,避免日志爆炸
-enum DouyinModelsDebug {
-    nonisolated(unsafe) static var dumpedOnce: Bool = false
-}
+// MARK: - DouyinModelsDebug 已废弃,所有一次性诊断代码已删除
+// HLS URL 现在从 live_core_sdk_data.pull_data.stream_data.data[default_quality].main.hls 解析

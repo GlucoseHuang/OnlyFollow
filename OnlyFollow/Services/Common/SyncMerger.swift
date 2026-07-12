@@ -39,6 +39,9 @@ enum SyncMerger {
         try mergeHistory(snapshot.history, into: context, stats: &stats)
         try mergeVideos(snapshot.videos, into: context, stats: &stats)
         try mergeLiveHistory(snapshot.liveHistory, into: context, stats: &stats)
+        // 删孤立的 VideoRecord: 作者已不在关注列表 且 没被 fav/pl/history 引用
+        // 处理"远端设备 unfollow → 本机 merge 完 creators 后,残留的 VideoRecord 该清掉"的传播
+        try purgeOrphanedVideos(in: context, stats: &stats)
 
         // 一次 save 提交所有变更
         do {
@@ -68,7 +71,13 @@ enum SyncMerger {
                     local.avatarURL = d.avatarURL
                     local.platform = d.platform
                     local.addedAt = d.addedAt
-                    local.bulkFetchCompletedAt = d.bulkFetchCompletedAt
+                    // 修复 Bug 1 (云同步分支): bulkFetchCompletedAt 视为"不可逆的成果"
+                    // 远端是 nil(代表远端没拉完/没拉过)时,不能覆盖本地已完成的 .now
+                    // 避免 iPhone 拉完 → iPad 没拉 → 合并时 iPhone 完成的标记被擦掉
+                    if d.bulkFetchCompletedAt != nil {
+                        local.bulkFetchCompletedAt = d.bulkFetchCompletedAt
+                    }
+                    // bulkFetchNextPage / bulkFetchTotal 正常覆盖
                     local.bulkFetchNextPage = d.bulkFetchNextPage
                     local.bulkFetchTotal = d.bulkFetchTotal
                     local.hasCompletedInitialSync = d.hasCompletedInitialSync
@@ -222,7 +231,13 @@ enum SyncMerger {
                     local.bvid = d.bvid
                     local.title = d.title
                     local.coverURL = d.coverURL
-                    local.webURL = d.webURL
+                    // webURL 不再上云;DTO 里有就用(老 snapshot),没有就从 aid 现场拼
+                    // local 自己有值且不为空时,保留(避免幂等更新时丢信息)
+                    if let url = d.webURL, !url.isEmpty {
+                        local.webURL = url
+                    } else if local.webURL.isEmpty {
+                        local.webURL = "https://www.bilibili.com/video/av\(d.aid)"
+                    }
                     local.duration = d.duration
                     local.publishTime = d.publishTime
                     local.viewCount = d.viewCount
@@ -233,8 +248,19 @@ enum SyncMerger {
                     local.authorAvatar = d.authorAvatar
                     local.firstSeenAt = d.firstSeenAt
                     local.lastRefreshedAt = d.lastRefreshedAt
-                    local.titleTokens = d.titleTokens
-                    local.authorTokens = d.authorTokens
+                    // tokens 不再上云;DTO 里有就用(老 snapshot),没有时:
+                    //   - title 变了 → 重算
+                    //   - title 没变 → 保留 local(避免无谓重算)
+                    if let t = d.titleTokens, !t.isEmpty {
+                        local.titleTokens = t
+                    } else if local.title != d.title || local.titleTokens.isEmpty {
+                        local.titleTokens = SearchTokenizer.tokenString(for: d.title)
+                    }
+                    if let t = d.authorTokens, !t.isEmpty {
+                        local.authorTokens = t
+                    } else if local.authorName != d.authorName || local.authorTokens.isEmpty {
+                        local.authorTokens = SearchTokenizer.tokenString(for: d.authorName)
+                    }
                     // 合集 ID/标题: 老 snapshot 没这两个字段时是 nil, 不会覆盖 local 的有效值
                     if let sid = d.ugcSeasonID { local.ugcSeasonID = sid }
                     if let st = d.ugcSeasonTitle { local.ugcSeasonTitle = st }
@@ -281,6 +307,34 @@ enum SyncMerger {
             }
         }
     }
+
+    /// 删除孤立的 VideoRecord
+    /// - 条件:authorUID ∉ creators(本机关注的 UP 主) 且 aid ∉ (fav ∪ playlist ∪ history)
+    /// - 严格隔离:LiveHistory 不算"引用"(存的是 roomID 不是 video aid)
+    /// - 触发:远端设备 unfollow → 本机 merge 完 creators 后,残留的 VideoRecord 该清掉
+    /// - 安全:即便 purge 错了,下次 sync 还能从远端 creators 拉回来
+    private static func purgeOrphanedVideos(in context: ModelContext, stats: inout MergeStats) throws {
+        let creators = (try? context.fetch(FetchDescriptor<FollowedCreator>())) ?? []
+        let followedUids = Set(creators.map(\.uid))
+
+        let favAids = Set((try? context.fetch(FetchDescriptor<FavoriteVideo>()))?.map(\.aid) ?? [])
+        let plAids = Set((try? context.fetch(FetchDescriptor<PlaylistItem>()))?.map(\.aid) ?? [])
+        let histAids = Set((try? context.fetch(FetchDescriptor<PlaybackHistory>()))?.map(\.aid) ?? [])
+
+        let allVideos = (try? context.fetch(FetchDescriptor<VideoRecord>())) ?? []
+        for v in allVideos {
+            if !followedUids.contains(v.authorUID),
+               !favAids.contains(v.aid),
+               !plAids.contains(v.aid),
+               !histAids.contains(v.aid) {
+                context.delete(v)
+                stats.videosDeleted += 1
+            }
+        }
+        if stats.videosDeleted > 0 {
+            AppLogger.info("SyncMerger: purgeOrphanedVideos removed \(stats.videosDeleted) VideoRecord(s) (author not in creators AND aid not in fav/pl/history)")
+        }
+    }
 }
 
 // MARK: - 统计
@@ -301,13 +355,16 @@ struct MergeStats {
     var videosInserted = 0
     var videosUpdated = 0
     var videosKept = 0
+    /// 孤立的 VideoRecord 被删的数量(作者不在关注列表 且 没被 fav/pl/history 引用)
+    var videosDeleted = 0
 
     var totalChanges: Int {
         creatorsInserted + creatorsUpdated +
         favoritesInserted + favoritesUpdated +
         playlistInserted + playlistUpdated +
         historyInserted + historyUpdated +
-        videosInserted + videosUpdated
+        videosInserted + videosUpdated +
+        videosDeleted
     }
 
     var liveHistoryInserted: Int = 0
@@ -315,7 +372,7 @@ struct MergeStats {
     var liveHistoryKept: Int = 0
 
     var summary: String {
-        "creators +\(creatorsInserted)/~\(creatorsUpdated), fav +\(favoritesInserted)/~\(favoritesUpdated), pl +\(playlistInserted)/~\(playlistUpdated), hist +\(historyInserted)/~\(historyUpdated), vid +\(videosInserted)/~\(videosUpdated), liveHist +\(liveHistoryInserted)/~\(liveHistoryUpdated)"
+        "creators +\(creatorsInserted)/~\(creatorsUpdated), fav +\(favoritesInserted)/~\(favoritesUpdated), pl +\(playlistInserted)/~\(playlistUpdated), hist +\(historyInserted)/~\(historyUpdated), vid +\(videosInserted)/~\(videosUpdated)/-\(videosDeleted), liveHist +\(liveHistoryInserted)/~\(liveHistoryUpdated)"
     }
 }
 
@@ -434,13 +491,23 @@ private enum PlaybackHistoryDTOApplier {
 
 private enum VideoRecordDTOApplier {
     static func make(from d: VideoDTO) -> VideoRecord {
+        // tokens 不再上云;DTO 里有就用(老 snapshot),没有就从 title/authorName 现场算
+        // - 现场算后立即写到 VideoRecord 本地,后续搜索直接走快速路径
+        let titleTokens = d.titleTokens.flatMap { $0.isEmpty ? nil : $0 }
+            ?? SearchTokenizer.tokenString(for: d.title)
+        let authorTokens = d.authorTokens.flatMap { $0.isEmpty ? nil : $0 }
+            ?? SearchTokenizer.tokenString(for: d.authorName)
+        // webURL 同上:DTO 里有就用(老 snapshot),没有就从 aid 拼
+        let webURL = d.webURL.flatMap { $0.isEmpty ? nil : $0 }
+            ?? "https://www.bilibili.com/video/av\(d.aid)"
+
         return VideoRecord(
             aid: d.aid,
             platform: d.platform,
             bvid: d.bvid,
             title: d.title,
             coverURL: d.coverURL,
-            webURL: d.webURL,
+            webURL: webURL,
             duration: d.duration,
             publishTime: d.publishTime,
             viewCount: d.viewCount,
@@ -451,8 +518,8 @@ private enum VideoRecordDTOApplier {
             authorAvatar: d.authorAvatar,
             firstSeenAt: d.firstSeenAt,
             lastRefreshedAt: d.lastRefreshedAt,
-            titleTokens: d.titleTokens,
-            authorTokens: d.authorTokens,
+            titleTokens: titleTokens,
+            authorTokens: authorTokens,
             ugcSeasonID: d.ugcSeasonID,
             ugcSeasonTitle: d.ugcSeasonTitle
         ).also { $0.lastModifiedAt = d.lastModifiedAt }

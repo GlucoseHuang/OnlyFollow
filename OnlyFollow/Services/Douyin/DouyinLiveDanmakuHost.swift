@@ -18,6 +18,9 @@ import Combine
 final class LiveDanmakuHost: ObservableObject {
     @Published private(set) var messages: [DanmakuMessage] = []
     @Published private(set) var isConnected: Bool = false
+    /// 直播间实时人数 (抖音: WebcastRoomStatsMessage 的 displayLong 解析; B 站: popularity)
+    /// - 0 表示还没收到 WS 数据
+    @Published private(set) var viewerCount: Int = 0
 
     private var service: AnyObject?
     private var cancellables = Set<AnyCancellable>()
@@ -30,6 +33,7 @@ final class LiveDanmakuHost: ObservableObject {
     func attach(bili: BilibiliDanmakuService) {
         service = bili
         cancellables.removeAll()
+        viewerCount = 0
         cancellables.insert(
             bili.$messages
                 .receive(on: RunLoop.main)
@@ -40,6 +44,11 @@ final class LiveDanmakuHost: ObservableObject {
                 .receive(on: RunLoop.main)
                 .sink { [weak self] in self?.isConnected = $0 }
         )
+        cancellables.insert(
+            bili.$popularity
+                .receive(on: RunLoop.main)
+                .sink { [weak self] in self?.viewerCount = $0 }
+        )
         connectImpl = { [weak bili] in bili?.connect() }
         disconnectImpl = { [weak bili] in bili?.disconnect() }
     }
@@ -48,6 +57,7 @@ final class LiveDanmakuHost: ObservableObject {
     func attach(douyin: DouyinDanmakuService) {
         service = douyin
         cancellables.removeAll()
+        viewerCount = 0
         cancellables.insert(
             douyin.$messages
                 .receive(on: RunLoop.main)
@@ -57,6 +67,11 @@ final class LiveDanmakuHost: ObservableObject {
             douyin.$isConnected
                 .receive(on: RunLoop.main)
                 .sink { [weak self] in self?.isConnected = $0 }
+        )
+        cancellables.insert(
+            douyin.$viewerCount
+                .receive(on: RunLoop.main)
+                .sink { [weak self] in self?.viewerCount = $0 }
         )
         connectImpl = { [weak douyin] in await douyin?.connect() }
         disconnectImpl = { [weak douyin] in await douyin?.disconnect() }

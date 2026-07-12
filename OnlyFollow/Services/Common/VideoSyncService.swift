@@ -122,6 +122,8 @@ enum VideoSyncService {
             let totalChanged = creator.bulkFetchTotal != pageInfo.count
             let isSinglePage = pageInfo.count <= pageInfo.ps
             let wasComplete = creator.bulkFetchCompletedAt != nil
+            // DEBUG: 验证 Bug 1 - 状态机决策
+            AppLogger.info("DEBUG refreshOneBilibili: uid=\(creator.uid) name=\(creator.nickname) pageInfo.count=\(pageInfo.count) pageInfo.ps=\(pageInfo.ps) totalChanged=\(totalChanged) isSinglePage=\(isSinglePage) wasComplete=\(wasComplete) [before: total=\(creator.bulkFetchTotal) completedAt=\(creator.bulkFetchCompletedAt?.description ?? "nil")]")
             if totalChanged || isSinglePage {
                 VideoCatalog.updateBulkFetchState(
                     for: creator,
@@ -313,7 +315,13 @@ enum VideoSyncService {
             let ps = pageInfo.ps
             let pagesFetched = nextPage
             let totalPages = min((total + ps - 1) / ps, bulkFetchMaxPages)
-            let isCompleted = pagesFetched >= totalPages || videos.isEmpty || videos.count < ps
+            // isCompleted 条件: 拉完所有页 OR 视频为空 OR 单页不足 OR **cache 视频数已经 == total**
+            // 最后一个条件是为了修复 Bug 1:
+            // 当 cache 从磁盘加载已经有了完整数据,而 bulk fetch 因为 aid 重复去重不增加,
+            // 单纯的 pagesFetched/totalPages 永远满足不了 → 死循环
+            let cachedAfterAppend = VideoCache.shared.videos(for: creator.uid)?.count ?? 0
+            let dataAlreadyComplete = total > 0 && cachedAfterAppend >= total
+            let isCompleted = pagesFetched >= totalPages || videos.isEmpty || videos.count < ps || dataAlreadyComplete
 
             VideoCatalog.updateBulkFetchState(
                 for: creator,
@@ -323,7 +331,9 @@ enum VideoSyncService {
                 in: context
             )
 
-            AppLogger.info("VideoSyncService: B 站 bulk fetch \(creator.nickname) page=\(nextPage)/\(totalPages), returned=\(videos.count), completed=\(isCompleted)")
+            AppLogger.info("VideoSyncService: B 站 bulk fetch \(creator.nickname) page=\(nextPage)/\(totalPages), returned=\(videos.count), completed=\(isCompleted) (dataAlreadyComplete=\(dataAlreadyComplete))")
+            // DEBUG: 验证 Bug 1 - 关键检测: cache 里的视频数 == total 但 completedAt 仍为 nil?
+            AppLogger.info("DEBUG continueBulkFetchBilibili: uid=\(creator.uid) name=\(creator.nickname) total=\(total) cached=\(cachedAfterAppend) completedAt=\(isCompleted ? "set to .now" : "kept nil") [after: total=\(creator.bulkFetchTotal) completedAt=\(creator.bulkFetchCompletedAt?.description ?? "nil") nextPage=\(creator.bulkFetchNextPage)]")
             return !isCompleted
         } catch APIError.rateLimited {
             AppLogger.error("VideoSyncService: B 站 bulk fetch 限流，暂停 \(creator.nickname)")
@@ -390,6 +400,8 @@ enum VideoSyncService {
         // 平台分发：抖音也参与 bulk fetch（B 站按 page 翻，抖音按 max_cursor 翻）
         let predicate = #Predicate<FollowedCreator> { $0.bulkFetchCompletedAt == nil }
         let pending = (try? context.fetch(FetchDescriptor<FollowedCreator>(predicate: predicate))) ?? []
+        // DEBUG: 验证 Bug 2 - opportunisticBulkFetchStep 实际拿的是哪个 creator
+        AppLogger.info("DEBUG opportunisticBulkFetchStep: pending.count=\(pending.count), pending.first=\(pending.first.map { "\($0.nickname)(uid=\($0.uid))" } ?? "nil")")
         guard let next = pending.first else { return 0 }
         let hasMore = await continueBulkFetch(creator: next, in: context)
         return hasMore ? pending.count : pending.count - 1
@@ -397,22 +409,87 @@ enum VideoSyncService {
 
     /// 机会式批量拉取 — 多页循环
     /// - 在 foreground 触发时调用，一次性推进 N 页（约 3.5s/页，所以 10 页 ≈ 35s）
-    /// - 命中 -799 限流会自动停（continueBulkFetch 内部处理）
+    /// - 命中 -799 限流/风控会 break 本轮（不再 sleep + 重试），等下次 scenePhase active 再继续
     /// - 支持 Task 取消：用户切后台时取消循环，不会在后台瞎跑
     /// - 返回实际推进的页数
     @discardableResult
     static func opportunisticBulkFetchLoop(in context: ModelContext, maxPages: Int = 10) async -> Int {
+        AppLogger.info("DEBUG opportunisticBulkFetchLoop: START maxPages=\(maxPages)")
         var processed = 0
-        for _ in 0..<maxPages {
+        for i in 0..<maxPages {
             if Task.isCancelled { break }
             let remaining = await opportunisticBulkFetchStep(in: context)
             processed += 1
+            AppLogger.info("DEBUG opportunisticBulkFetchLoop: iter=\(i)/\(maxPages) remaining=\(remaining)")
             if remaining == 0 { break }  // 所有 UP 主都拉完了
+            // 如果这一页被限流/风控(continueBulkFetch 内部返回 true 表示还有下一页),
+            // 区分两种"还有下一页": 真正还有 vs 被限流暂停
+            // 限流暂停: 下次大概率还是被限流,继续 sleep 只会浪费电,本轮直接 break
+            if await isLikelyRateLimitedOrAntiCrawler() {
+                AppLogger.warning("VideoSyncService: 限流/风控,本轮 bulk fetch loop 提前 break,等下次 scenePhase active 再继续 (processed=\(processed)/\(maxPages))")
+                break
+            }
         }
+        AppLogger.info("DEBUG opportunisticBulkFetchLoop: END processed=\(processed)/\(maxPages)")
         if processed > 0 {
             AppLogger.info("VideoSyncService: bulk fetch loop 跑了 \(processed) 页")
         }
         return processed
+    }
+
+    /// 检查最近一次 API 调用是否被限流/风控（用于 loop 中提前 break）
+    /// 通过查询 BilibiliAPIService 内部计数器判断
+    private static func isLikelyRateLimitedOrAntiCrawler() async -> Bool {
+        await BilibiliAPIService.shared.isLikelyRateLimitedOrAntiCrawler()
+    }
+
+    /// 指定 creator 拉取 — 用于详情页「立即补全历史」按钮
+    /// - 只针对传入的 creator,不会去拉其他未完成的
+    /// - 一直拉到完成 / 限流 / 跑完 maxPages
+    /// - 命中限流/风控时本轮直接退出(break),等用户重新点击再继续
+    /// - 返回:(处理的页数, 是否完成)
+    @discardableResult
+    static func bulkFetchForCreator(creator: FollowedCreator, in context: ModelContext, maxPages: Int = 200) async -> (pages: Int, completed: Bool) {
+        let creatorID = creator.uid
+        let creatorName = creator.nickname
+        AppLogger.info("DEBUG bulkFetchForCreator: START creator=\(creatorName) uid=\(creatorID) maxPages=\(maxPages) [before: completedAt=\(creator.bulkFetchCompletedAt?.description ?? "nil") nextPage=\(creator.bulkFetchNextPage) total=\(creator.bulkFetchTotal) cached=\(VideoCache.shared.videos(for: creatorID)?.count ?? 0)]")
+        var pages = 0
+        var completed = creator.bulkFetchCompletedAt != nil
+        for i in 0..<maxPages {
+            if Task.isCancelled { break }
+            // 每次循环重新拉一次 creator,避免 detached context 里拿旧引用
+            let target = fetchCreator(uid: creatorID, in: context)
+            guard let target else {
+                AppLogger.warning("VideoSyncService: bulkFetchForCreator 找不到 creator uid=\(creatorID), 中断")
+                break
+            }
+            if target.bulkFetchCompletedAt != nil {
+                AppLogger.info("VideoSyncService: bulkFetchForCreator \(creatorName) 已完成,提前 break")
+                completed = true
+                break
+            }
+            let hasMore = await continueBulkFetch(creator: target, in: context)
+            pages += 1
+            if !hasMore {
+                completed = true
+                break
+            }
+            // 限流/风控: break
+            if await isLikelyRateLimitedOrAntiCrawler() {
+                AppLogger.warning("VideoSyncService: bulkFetchForCreator \(creatorName) 限流/风控,本轮退出 (pages=\(pages)/\(maxPages))")
+                break
+            }
+            _ = i
+        }
+        let finalCached = VideoCache.shared.videos(for: creatorID)?.count ?? 0
+        AppLogger.info("DEBUG bulkFetchForCreator: END creator=\(creatorName) pages=\(pages) completed=\(completed) finalCached=\(finalCached)")
+        return (pages, completed)
+    }
+
+    /// 根据 uid 拉取最新 FollowedCreator 引用(detached context 安全)
+    private static func fetchCreator(uid: String, in context: ModelContext) -> FollowedCreator? {
+        let predicate = #Predicate<FollowedCreator> { $0.uid == uid }
+        return (try? context.fetch(FetchDescriptor<FollowedCreator>(predicate: predicate)))?.first
     }
 
     /// 把所有已 follow 但还没开始 bulk fetch 的 creator 状态初始化

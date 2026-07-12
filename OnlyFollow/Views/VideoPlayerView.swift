@@ -25,6 +25,7 @@ struct VideoPlayerView: View {
     @State private var sleepTimerTask: Task<Void, Never>?
     /// 周期保存进度的后台任务（每 5 秒一次）
     @State private var progressSaveTask: Task<Void, Never>?
+    @Environment(\.scenePhase) private var scenePhase
     /// 显式传入的 ModelContext：PlayerPresenter 走 UIKit present 时 @Environment(\.modelContext)
     /// 拿不到，必须由调用方传进来；NavigationLink / sheet 路径也传，方便行为一致
     let modelContext: ModelContext
@@ -58,7 +59,7 @@ struct VideoPlayerView: View {
                     .ignoresSafeArea()
             }
 
-            if vm.danmakuEnabled {
+            if vm.danmakuEnabled && AppSettings.danmakuDensity != .off {
                 // 弹幕需要跟 topBar 视觉平齐：都不越过安全区。
                 // 不再 .ignoresSafeArea()：弹幕 top 与 topBar 顶部对齐（都从 status bar 下面开始），
                 // 弹幕底部自然停在 home indicator 之上。
@@ -91,8 +92,18 @@ struct VideoPlayerView: View {
             // 锁定后双击/单击不响应，控件也会被隐藏
             lockButton
         }
+        .playbackGestures(
+            enabled: !isLocked,
+            supportsSeek: true,
+            duration: vm.duration,
+            currentTime: vm.currentTime,
+            onSeek: { vm.seek(to: $0) }
+        )
         .preferredColorScheme(.dark)
         .statusBarHidden(vm.isFullscreen)
+        .onChange(of: scenePhase) { _, newPhase in
+            vm.handleScenePhase(newPhase)
+        }
         .toolbar(vm.isFullscreen ? .hidden : .visible, for: .navigationBar)
         .navigationBarBackButtonHidden(true)
         // 顶层不忽略 safe area：让顶部 / 底部的控件自然落在安全区里，不与状态栏 / Home indicator 重叠。
@@ -112,6 +123,8 @@ struct VideoPlayerView: View {
             // 整个 load + 控制中心注册流程放到 loadTask 里。
             // onDisappear 会显式 cancel 这个 task，load() 里的 await 就会抛 CancellationError 退出，
             // 不会在 view 已经消失后还继续创建出 player.play() 制造“关了页面还能听到声音”。
+            // 挂上系统音量调节所需的隐藏 MPVolumeView(幂等, 多次进入只挂一次)
+            SystemVolumeController.shared.attach()
             loadTask = Task {
                 // 0. 把 modelContext 注入 vm(让合集/推荐能用)
                 vm.modelContext = modelContext
@@ -304,13 +317,32 @@ struct VideoPlayerView: View {
                 Text(vm.video.authorName).font(.caption).foregroundStyle(.white.opacity(0.7))
             }
             Spacer()
-            Button { vm.toggleDanmaku() } label: {
-                Image(systemName: vm.danmakuEnabled ? "text.bubble.fill" : "text.bubble")
+            // 弹幕开关: 改成 Menu, 三档 (off / sparse / dense), 用户可对比两种模式性能
+            // - sparse: 原来的贪心算法, 同 lifetime 窗口每轨只放一条 → 画面稀疏
+            // - dense: 现在的 canShoot, 长弹幕走更快所以同轨可放更多 → 画面密集
+            // - off: 完全不显示
+            Menu {
+                ForEach(AppSettings.DanmakuDensity.allCases, id: \.self) { mode in
+                    Button {
+                        AppSettings.danmakuDensity = mode
+                    } label: {
+                        HStack {
+                            Text(mode.label)
+                            if mode == AppSettings.danmakuDensity {
+                                Spacer()
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: danmakuMenuIcon)
                     .font(.title3)
-                    .foregroundStyle(vm.danmakuEnabled ? .yellow : .white)
+                    .foregroundStyle(AppSettings.danmakuDensity == .off ? .white : .yellow)
                     .padding(8)
                     .background(.black.opacity(0.3), in: .circle)
             }
+            .accessibilityLabel("弹幕密度")
             // 分P入口：仅当该视频是分P视频时显示(用 rectangle.stack.fill, 跟合集的 square.stack.3d.up.fill 视觉区分)
             if vm.hasMultipleParts {
                 Button {
@@ -435,6 +467,18 @@ struct VideoPlayerView: View {
 
     /// 锁定屏幕按钮：屏幕右侧中部
     /// 锁定时切图标为解锁，再点回到 unlock
+    /// 弹幕密度按钮的 icon（按当前 mode 返回不同 SF Symbol）
+    /// - off: text.bubble (空心)
+    /// - sparse: text.bubble (同上, Menu 上看 label 区分)
+    /// - dense: text.bubble.fill (实心)
+    private var danmakuMenuIcon: String {
+        switch AppSettings.danmakuDensity {
+        case .off: return "text.bubble"
+        case .sparse: return "text.bubble"
+        case .dense: return "text.bubble.fill"
+        }
+    }
+
     private var lockButton: some View {
         VStack {
             Spacer()

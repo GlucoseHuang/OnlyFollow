@@ -11,6 +11,8 @@ struct CreatorDetailView: View {
     @State private var showFavorites = false
     @State private var showPlaylist = false
     @State private var showUnfollowConfirm = false
+    /// 二次确认弹窗要展示的"会保留多少 / 删多少"统计
+    @State private var unfollowCounts: UnfollowService.RetainedCounts?
     /// 手动触发的 bulk fetch 任务（让用户一键补全该 UP 主历史视频）
     @State private var bulkFetchTask: Task<Void, Never>?
     @State private var isBulkFetching = false
@@ -70,6 +72,8 @@ struct CreatorDetailView: View {
                     }
                     Divider()
                     Button(role: .destructive) {
+                        // 先统计要保留 / 删除的条目数,弹窗展示给用户
+                        unfollowCounts = UnfollowService.countRetained(uid: creator.uid, in: modelContext)
                         showUnfollowConfirm = true
                     } label: {
                         Label("取消关注", systemImage: "person.crop.circle.badge.xmark")
@@ -91,7 +95,7 @@ struct CreatorDetailView: View {
             Button("取消关注", role: .destructive) { unfollow() }
             Button("再想想", role: .cancel) {}
         } message: {
-            Text("将从首页移除该 UP 主，已缓存的视频数据保留。")
+            Text(unfollowDialogMessage)
         }
         .sheet(isPresented: $showFavorites) {
             FavoritesView()
@@ -267,19 +271,31 @@ struct CreatorDetailView: View {
 
     // MARK: - 取消关注
 
-    /// 只删 FollowedCreator 实体；缓存的 VideoItem / LiveRoom 保留（用户明确要求）
+    /// 弹窗文案:展示"会保留多少 / 删多少"
+    /// - counts 在弹窗出现前已计算好,这里只是展示
+    private var unfollowDialogMessage: String {
+        guard let counts = unfollowCounts else {
+            return "将从首页移除该 UP 主。"
+        }
+        return UnfollowService.dialogMessage(for: counts)
+    }
+
+    /// 取消关注 + 清理该 UP 主的所有缓存(走 UnfollowService 统一入口)
     private func unfollow() {
-        AppLogger.info("Unfollow creator: uid=\(creator.uid), name=\(creator.nickname)")
-        modelContext.delete(creator)
-        modelContext.saveAndKickSync()
+        UnfollowService.unfollow(creator, in: modelContext)
+        unfollowCounts = nil
         dismiss()
     }
 
     // MARK: - Bulk fetch 一键补全
 
     /// 当前 UP 主是否还需要补全历史
+    /// 修复 Bug 1: 即使 completedAt 丢了,只要 cache 视频数 == total 就不算需要
     private var needsBulkFetch: Bool {
-        creator.bulkFetchCompletedAt == nil
+        if creator.bulkFetchCompletedAt != nil { return false }
+        let loaded = cache.videosByCreator[creator.uid]?.count ?? 0
+        if creator.bulkFetchTotal > 0 && loaded >= creator.bulkFetchTotal { return false }
+        return true
     }
 
     /// 已在 cache 里的视频数 vs API 返回的总数
@@ -291,41 +307,60 @@ struct CreatorDetailView: View {
 
     private var bulkFetchProgressSection: some View {
         let p = bulkFetchProgress
-        // 只有在"知道总数 + 未完成 + 总数大于当前 cache"时才显示
-        if creator.bulkFetchTotal > 0 && needsBulkFetch && p.total > p.loaded {
-            return AnyView(
-                VStack(alignment: .leading, spacing: 8) {
+        // 三种情况:
+        // 1) 不知道总数(bulkFetchTotal=0) → 不显示(等 incremental refresh 跑完)
+        // 2) 视频已完整(cache 视频数 == total) → 显示绿色"已完整加载" 提示(修复 Bug 1)
+        // 3) 视频未完整 + 仍有未拉 → 显示"立即补全历史" 按钮
+        if creator.bulkFetchTotal > 0 {
+            let isFullyLoaded = p.loaded >= p.total
+            if isFullyLoaded {
+                return AnyView(
                     HStack(spacing: 6) {
-                        Image(systemName: "tray.and.arrow.down")
-                            .foregroundStyle(.blue)
-                        Text("该 UP 主共 \(p.total) 个视频，已加载 \(p.loaded)")
+                        Image(systemName: "checkmark.seal.fill")
+                            .foregroundStyle(.green)
+                        Text("已完整加载 \(p.loaded) 个视频")
                             .font(.caption)
+                            .foregroundStyle(.green)
                         Spacer()
                     }
-                    Button {
-                        startManualBulkFetch()
-                    } label: {
-                        HStack {
-                            if isBulkFetching {
-                                ProgressView().scaleEffect(0.8)
-                                Text("补全中…")
-                            } else {
-                                Image(systemName: "arrow.down.circle.fill")
-                                Text("立即补全历史")
-                            }
+                    .padding(10)
+                    .background(.green.opacity(0.1), in: .rect(cornerRadius: 10))
+                )
+            } else if p.total > p.loaded {
+                return AnyView(
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "tray.and.arrow.down")
+                                .foregroundStyle(.blue)
+                            Text("该 UP 主共 \(p.total) 个视频，已加载 \(p.loaded)")
+                                .font(.caption)
+                            Spacer()
                         }
-                        .font(.caption.bold())
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 8)
-                        .background(.blue.opacity(0.15), in: .rect(cornerRadius: 8))
-                        .foregroundStyle(.blue)
+                        Button {
+                            startManualBulkFetch()
+                        } label: {
+                            HStack {
+                                if isBulkFetching {
+                                    ProgressView().scaleEffect(0.8)
+                                    Text("补全中…")
+                                } else {
+                                    Image(systemName: "arrow.down.circle.fill")
+                                    Text("立即补全历史")
+                                }
+                            }
+                            .font(.caption.bold())
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(.blue.opacity(0.15), in: .rect(cornerRadius: 8))
+                            .foregroundStyle(.blue)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isBulkFetching)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(isBulkFetching)
-                }
-                .padding(10)
-                .background(.background.secondary, in: .rect(cornerRadius: 10))
-            )
+                    .padding(10)
+                    .background(.background.secondary, in: .rect(cornerRadius: 10))
+                )
+            }
         }
         return AnyView(EmptyView())
     }
@@ -335,12 +370,18 @@ struct CreatorDetailView: View {
         bulkFetchTask?.cancel()
         isBulkFetching = true
         let context = modelContext
+        let targetUID = creator.uid
+        // DEBUG: 验证 Bug 2 - 用户点的 creator 是什么
+        AppLogger.info("DEBUG startManualBulkFetch: clicked creator=\(creator.nickname) uid=\(creator.uid) completedAt=\(creator.bulkFetchCompletedAt?.description ?? "nil") total=\(creator.bulkFetchTotal)")
         bulkFetchTask = Task { @MainActor in
-            let processed = await VideoSyncService.opportunisticBulkFetchLoop(
+            // 修复 Bug 2: 详情页「立即补全历史」必须只补全当前 UP 主,不能去拉别人
+            // 用新的 bulkFetchForCreator 而不是通用的 opportunisticBulkFetchLoop
+            let result = await VideoSyncService.bulkFetchForCreator(
+                creator: creator,
                 in: context,
                 maxPages: 200
             )
-            AppLogger.info("CreatorDetailView: 手动补全 \(creator.nickname) 跑了 \(processed) 页")
+            AppLogger.info("CreatorDetailView: 手动补全 \(targetUID) 跑了 \(result.pages) 页, completed=\(result.completed)")
             isBulkFetching = false
         }
     }

@@ -22,6 +22,8 @@ struct DouyinLiveRoomInfo {
     let isLiving: Bool
     let flvURL: String?
     let hlsURL: String?
+    /// 抖音专属: 每个画质对应的 HLS m3u8 URL
+    var hlsURLsByQuality: [String: String] = [:]
     let ownerSecUid: String?
     let ownerNickname: String?
     let ownerAvatarURL: String?
@@ -29,6 +31,18 @@ struct DouyinLiveRoomInfo {
     /// 从 LiveRoom API 响应构造
     static func from(_ resp: DouyinLiveRoomResponse) -> DouyinLiveRoomInfo {
         let r = resp.room
+        let stream = r?.streamURL
+        // HLS URL 优先级: map 里的最高画质 > 单 string 字段 > nil
+        // 抖音 web 端 HLS 实际在 hls_pull_url_map (Dict),hls_pull_url 是旧字段
+        let hlsURL: String? = {
+            if let map = stream?.hlsPullUrlMap {
+                return map["FULL_HD1"] ?? map["HD1"] ?? map["SD1"] ?? map["SD2"] ?? map.values.first
+            }
+            return stream?.hlsPullURL
+        }()
+        // 画质字典: enter 接口给的是 hls_pull_url_map, sdk_key-style key
+        // 这里的 map key 是 FULL_HD1/HD1/SD1/SD2 (不是 ld/sd/hd/uhd/origin), 与 user profile 不同
+        // 留空,画质切换 UI 在 user profile 成功时不依赖这里
         return DouyinLiveRoomInfo(
             webcastId: r?.idStr ?? "",
             roomId: r?.idStr ?? "",
@@ -36,8 +50,9 @@ struct DouyinLiveRoomInfo {
             coverURL: r?.coverURL ?? "",
             viewerCount: r?.userCount ?? 0,
             isLiving: r?.status == 2,
-            flvURL: r?.streamURL?.flvPullURL,
-            hlsURL: r?.streamURL?.hlsPullURL,
+            flvURL: stream?.flvPullURL,
+            hlsURL: hlsURL,
+            hlsURLsByQuality: [:],
             ownerSecUid: resp.user?.secUid,
             ownerNickname: resp.user?.nickname,
             ownerAvatarURL: resp.user?.avatarURL
@@ -46,12 +61,12 @@ struct DouyinLiveRoomInfo {
 
     /// 转为项目内部的 LiveRoom（VideoPlayerView 用这个）
     func toLiveRoom() -> LiveRoom {
-        LiveRoom(
+        var room = LiveRoom(
             id: roomId,
             roomID: roomId,
             title: title,
             coverURL: coverURL,
-            streamURL: flvURL ?? hlsURL ?? "",
+            streamURL: hlsURL ?? flvURL ?? "",
             viewerCount: viewerCount,
             authorUID: ownerSecUid ?? "",
             authorName: ownerNickname ?? "",
@@ -59,6 +74,8 @@ struct DouyinLiveRoomInfo {
             platform: "douyin",
             isLive: isLiving
         )
+        room.hlsURLsByQuality = hlsURLsByQuality
+        return room
     }
 
     /// 从 URL 提取 webcast_id

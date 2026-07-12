@@ -49,15 +49,13 @@ enum VideoCatalog {
                 r.authorAvatar = v.authorAvatar
                 r.lastRefreshedAt = now
                 r.lastModifiedAt = now
-                let tok = precomputeTokens(title: v.title, author: v.authorName)
-                r.titleTokens = tok.titleTokens
-                r.authorTokens = tok.authorTokens
+                r.titleTokens = SearchTokenizer.tokenString(for: v.title)
+                r.authorTokens = SearchTokenizer.tokenString(for: v.authorName)
                 // 合集 ID: sync 阶段拿不到(fetchVideoDetail 才有), 但播放过的视频会带过来
                 // 用 ?? nil 保护 nil 值不被覆盖(已有但新值是 nil 的情况)
                 if let sid = v.ugcSeasonID { r.ugcSeasonID = sid }
                 if let st = v.ugcSeasonTitle { r.ugcSeasonTitle = st }
             } else {
-                let tok = precomputeTokens(title: v.title, author: v.authorName)
                 let record = VideoRecord(
                     aid: v.aid,
                     platform: v.platform,
@@ -75,8 +73,8 @@ enum VideoCatalog {
                     authorAvatar: v.authorAvatar,
                     firstSeenAt: now,
                     lastRefreshedAt: now,
-                    titleTokens: tok.titleTokens,
-                    authorTokens: tok.authorTokens,
+                    titleTokens: SearchTokenizer.tokenString(for: v.title),
+                    authorTokens: SearchTokenizer.tokenString(for: v.authorName),
                     ugcSeasonID: v.ugcSeasonID,
                     ugcSeasonTitle: v.ugcSeasonTitle
                 )
@@ -95,25 +93,6 @@ enum VideoCatalog {
             return []
         }
         return insertedAids
-    }
-
-    /// 预计算 title / author 各自的分词（空格分隔，去重）
-    /// 拆分存储的好处：搜索时不用重新分词，且能区分「标题命中」和「UP 主名命中」的权重
-    private static func precomputeTokens(title: String, author: String) -> (titleTokens: String, authorTokens: String) {
-        return (
-            uniqueJoined(SearchTokenizer.tokens(for: title)),
-            uniqueJoined(SearchTokenizer.tokens(for: author))
-        )
-    }
-
-    private static func uniqueJoined(_ tokens: [String]) -> String {
-        var seen = Set<String>()
-        var unique: [String] = []
-        for t in tokens where !seen.contains(t) {
-            seen.insert(t)
-            unique.append(t)
-        }
-        return unique.joined(separator: " ")
     }
 
     // MARK: - 查询
@@ -212,6 +191,13 @@ enum VideoCatalog {
         total: Int?,
         in context: ModelContext
     ) {
+        // DEBUG: 验证状态机 - 每次写入都打出来
+        let completedAtDesc: String
+        if completedAt == nil { completedAtDesc = "nil(=不修改)" }
+        else if completedAt == .some(nil) { completedAtDesc = ".some(nil)(=不修改,被 if let 跳过)" }
+        else if completedAt == .some(.now) { completedAtDesc = ".some(.now)" }
+        else { completedAtDesc = ".\(String(describing: completedAt))" }
+        AppLogger.info("DEBUG updateBulkFetchState: uid=\(creator.uid) name=\(creator.nickname) completedAt=\(completedAtDesc) nextPage=\(nextPage.map(String.init) ?? "nil") total=\(total.map(String.init) ?? "nil") [before: completedAt=\(creator.bulkFetchCompletedAt?.description ?? "nil") nextPage=\(creator.bulkFetchNextPage) total=\(creator.bulkFetchTotal)]")
         if let completedAt {
             creator.bulkFetchCompletedAt = completedAt
         }

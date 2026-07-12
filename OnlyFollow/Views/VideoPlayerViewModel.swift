@@ -27,6 +27,8 @@ final class VideoPlayerViewModel: ObservableObject {
     /// currentTime 上一次被 AVPlayer observer 写入的 wall time
     /// 弹幕渲染用它做插值，避免 AVPlayer 0.5s 采样导致 PPT 跳
     @Published private(set) var currentTimeUpdatedAt: Date = Date()
+    /// 切到后台的时刻（handleScenePhase 用），切回前台时重置 currentTimeUpdatedAt
+    private var lastBackgroundAt: Date?
     @Published var duration: Double = 0
     @Published var loadError: String?
     @Published var showControls = true
@@ -360,6 +362,7 @@ final class VideoPlayerViewModel: ObservableObject {
     /// 解析 B 站弹幕 XML 为 VideoDanmaku
     /// <d p="time,type,fontsize,color,timestamp,pool,user_hash,id">content</d>
     /// type: 1=滚动 4=底部 5=顶部 6=逆向 7=精准 8=高级
+    /// 轨道分配不在这里做 — 由 DanmakuFloatingView 在 view 层用真实 screenWidth 算 (支持 rotation)
     private func parseDanmakuXML(_ xml: String) -> [VideoDanmaku] {
         var result: [VideoDanmaku] = []
         let pattern = #"<d p="([^"]+)">([^<]*)</d>"#
@@ -383,23 +386,20 @@ final class VideoPlayerViewModel: ObservableObject {
             case 6: kind = .reverse
             default: kind = .scroll
             }
+            // 弹幕自然宽度（CJK 1.0 / ASCII 0.55 字符单位 × 基础字号 40）
+            // 实际渲染时如果超长会按屏幕宽度截断，这里用自然宽度参与碰撞检测
+            let textWidth = DanmakuTrackAssigner.widthUnits(of: text) * 40
             result.append(VideoDanmaku(
                 id: UUID(),
                 videoTime: time,
                 text: text,
                 color: colorHex,
-                kind: kind
+                kind: kind,
+                textWidth: textWidth
             ))
         }
-        // 1) 先按 videoTime 排序（XML 通常已是这个顺序，但保险起见排一下）
+        // 按 videoTime 排序（XML 通常已是这个顺序，但保险起见排一下）
         result.sort { $0.videoTime < $1.videoTime }
-        // 2) 给滚动弹幕分配轨道，参考 B 站客户端的碰撞检测
-        let trackMap = DanmakuTrackAssigner.assignTracks(to: result, lifetime: 6.0, trackCount: 5)
-        for i in result.indices {
-            if let track = trackMap[result[i].id] {
-                result[i].track = track
-            }
-        }
         return result
     }
 
@@ -412,6 +412,7 @@ final class VideoPlayerViewModel: ObservableObject {
         hideControlsTask?.cancel()
         preEndTask?.cancel()
         preEndTask = nil
+        lastBackgroundAt = nil
         if let token = timeObserverToken {
             avPlayer?.removeTimeObserver(token)
             timeObserverToken = nil
@@ -426,6 +427,30 @@ final class VideoPlayerViewModel: ObservableObject {
         // 关掉音频会话，避免后台继续持有音频焦点。
         // 注意：playback 模式下 .notifyOthersOnDeactivation 让其他 app 能正常接管音频。
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    // MARK: - 切后台 / 切回前台
+
+    /// 切到后台时由 VideoPlayerView 触发：记录切走时刻。
+    /// 切回前台时由 VideoPlayerView 触发：重置 currentTimeUpdatedAt，让弹幕 wallDelta
+    /// 从切回前台开始累加 → videoTime = currentTime + (now - lastUpdate) 等于"切回前台时的 videoTime 起点"，
+    /// 配合 player 在后台推进的 currentTime → 弹幕从切走时的位置继续飘（不跳到未来）
+    func handleScenePhase(_ newPhase: ScenePhase) {
+        switch newPhase {
+        case .background:
+            lastBackgroundAt = Date()
+        case .active:
+            if lastBackgroundAt != nil {
+                // 重置 lastUpdate wall time：让 wallDelta 从 0 开始累加
+                currentTimeUpdatedAt = Date()
+                lastBackgroundAt = nil
+            }
+        case .inactive:
+            // 短暂失去焦点（控制中心、通知中心等），UI 还在，不处理
+            break
+        @unknown default:
+            break
+        }
     }
 
     // MARK: - 控制

@@ -1,5 +1,6 @@
 import Foundation
 import Compression
+import zlib
 
 /// 抖音直播弹幕服务（@MainActor ObservableObject）
 ///
@@ -173,8 +174,9 @@ final class DouyinDanmakuService: NSObject, ObservableObject {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)  // 5s
                 if Task.isCancelled { break }
                 if self.isConnected {
-                    let ack = DouyinLiveSignature.heartbeatFrame()
-                    self.task?.send(.data(ack)) { error in
+                    // 标准心跳: PushFrame(payload_type='hb') protobuf 编码
+                    let hb = PushFrameEncoder.heartbeat()
+                    self.task?.send(.data(hb)) { error in
                         if let error {
                             AppLogger.error("DouyinDanmakuService: heartbeat send failed: \(error.localizedDescription)")
                         }
@@ -199,46 +201,72 @@ final class DouyinDanmakuService: NSObject, ObservableObject {
     // MARK: - Parse frame
 
     /// 解析一个 PushFrame 帧
-    /// - PushFrame 头部: seqId(8) + logId(8) + service(8) + method(8) = 32 字节
-    /// - 之后是 varint 编码的 headers 列表
-    /// - 然后是 varint payloadEncoding
-    /// - 然后是 varint payloadType
-    /// - 然后是 varint payload 长度 + payload 字节
-    /// (抖音实际是变长 varint,我们用简化的"32 字节头 + 直接找 payload 长度"做法)
+    /// - PushFrame 是标准 protobuf message (非固定头), 字段可乱序可省略
+    /// - proto3 默认值(0/空)不编码, 所以极小心跳帧只有 payloadType="hb" 一个字段
+    /// - 服务端 push 帧: 必有 payload(field 8) + 可能的 payloadEncoding(field 6, "gzip"|"pb")
+    /// - payload 是 gzip 压缩的 Response (proto bytes)
     private func parseFrame(data: Data) {
-        // 这里我们用 protobuf 二进制解码 (不是 varint 严格实现,而是直接读)
-        // 简化做法: 跳过前 32 字节(4 个 uint64), 找 payload 字段
-        // 抖音的真实帧格式：
-        //   header (32 bytes) + varint(int) = payload 长度 + payload 字节
-        // 但 varint 不是定长的，所以我们改成 "从后往前" 找 payload
-
-        // 实际上抖音直播 WS 帧是"TLV-like" 自定义二进制协议，不是标准 protobuf wire format
-        // 我们从已知样本中提取规律: payload 长度是帧的最后 4 字节
-        // 但抖音有时变 (有时 8 字节),所以最稳妥的方式是：手动 varint 解码
-
+        AppLogger.info("DouyinDanmakuService: 收到 WS 帧 raw len=\(data.count) hex0:8=\(data.prefix(8).map { String(format: "%02x", $0) }.joined(separator: " "))")
         guard let frame = try? PushFrameDecoder.decode(data) else {
             AppLogger.error("DouyinDanmakuService: PushFrame 解码失败 (len=\(data.count))")
+            sendAckForAnyFrame(data: data)
+            return
+        }
+        // 记住 logId, 服务端可能要求原样回 ack (saermart 实测)
+        lastLogId = frame.logId
+        AppLogger.info("DouyinDanmakuService: PushFrame 解码 ok — logId=\(frame.logId) payloadType=\(frame.payloadType) payloadEncoding=\(frame.payloadEncoding) payloadLen=\(frame.payload.count)")
+
+        // 服务端→客户端的心跳 ack 帧只有 payloadType="hb" 没有真正的弹幕 payload
+        // 跳过短 payload (心跳 ack payload 一般 20 字节左右)
+        if frame.payloadType == "hb" || frame.payload.isEmpty {
             return
         }
 
         let payloadData: Data
-        if frame.payloadEncoding == "gzip" || (frame.payloadEncoding.isEmpty && frame.payloadType.isEmpty) {
-            // 客户端→服务端的心跳 ack 也用 "gzip" encoding
-            // 但 payload 通常很短(20字节左右) — 可能是心跳,跳过
-            if frame.payload.count < 100 {
+        // 抖音服务端撒谎: payloadEncoding 字段常为 "pb" 但实际 payload 是 gzip 压缩
+        // 必须看头两个字节 (gzip magic = 0x1f 0x8b) 决定是否解压
+        if frame.payloadEncoding == "gzip" || frame.payload.starts(with: [0x1f, 0x8b]) {
+            do {
+                payloadData = try frame.payload.gunzipped()
+                AppLogger.info("DouyinDanmakuService: gunzipped \(frame.payload.count) -> \(payloadData.count) bytes (encoding=\(frame.payloadEncoding))")
+            } catch {
+                AppLogger.error("DouyinDanmakuService: gunzip 失败: \(error.localizedDescription) — 原始 payload hex0:8=\(frame.payload.prefix(8).map { String(format: "%02x", $0) }.joined(separator: " "))")
                 return
             }
-            payloadData = (try? frame.payload.gunzipped()) ?? Data()
         } else {
             payloadData = frame.payload
+            AppLogger.info("DouyinDanmakuService: raw pb payload \(payloadData.count) bytes (encoding=\(frame.payloadEncoding))")
         }
 
-        // 解 Response
         guard let response = try? ResponseDecoder.decode(payloadData) else {
-            AppLogger.error("DouyinDanmakuService: Response 解码失败 (len=\(payloadData.count))")
+            AppLogger.error("DouyinDanmakuService: Response 解码失败 (len=\(payloadData.count), encoding=\(frame.payloadEncoding), hex0:8=\(payloadData.prefix(8).map { String(format: "%02x", $0) }.joined(separator: " "))")
             return
         }
+        AppLogger.info("DouyinDanmakuService: Response 解析成功 — \(response.messages.count) msgs, methods=\(response.messages.map { $0.method }.joined(separator: ","))")
+        // need_ack 时回 ack (saermart 标准: 服务端发完一批消息要 ack)
+        if response.needAck {
+            sendAck(internalExt: response.internalExt)
+        }
         handleResponse(response)
+    }
+
+    /// 记住最后收到的 logId (用于 ack)
+    private var lastLogId: UInt64 = 0
+
+    /// 通用兜底 ack: 没成功解 PushFrame 时也回个空 ack, 不至于被服务端踢
+    private func sendAckForAnyFrame(data: Data) {
+        // 解不出 logId 就用 0 当兜底, 服务端会忽略
+        sendAck(internalExt: "")
+    }
+
+    /// 发送 ack 帧 (PushFrame(payload_type='ack', payload=internalExt))
+    private func sendAck(internalExt: String) {
+        let ack = PushFrameEncoder.ack(logId: lastLogId, internalExt: internalExt)
+        task?.send(.data(ack)) { error in
+            if let error {
+                AppLogger.error("DouyinDanmakuService: ack send failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func handleResponse(_ resp: ResponseData) {
@@ -259,31 +287,75 @@ final class DouyinDanmakuService: NSObject, ObservableObject {
     }
 
     private func handleChatMessage(_ msg: MessageData) {
-        // payload 是 JSON 字符串 {"content": "<base64 文本>", "user": {"nickname": "..."}, ...}
-        guard let payloadData = msg.payload.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
-              let contentB64 = json["content"] as? String else {
+        // ChatMessage proto (saermart/douyin.proto):
+        //   Common common = 1
+        //   User user = 2 (其中 nickName = field 3)
+        //   string content = 3
+        guard let payloadData = msg.rawPayload, payloadData.count > 0 else {
+            AppLogger.warning("DouyinDanmakuService: ChatMessage.rawPayload 为空")
             return
         }
-        // 解 base64 拿到弹幕内容
-        guard let decoded = Data(base64Encoded: contentB64),
-              let text = String(data: decoded, encoding: .utf8) else {
-            return
+        do {
+            let chat = try ChatMessageDecoder.decode(payloadData)
+            AppLogger.info("DouyinDanmakuService: ChatMessage 解析成功 — nick=\(chat.nickName) content=\(chat.content)")
+            let danmaku = DanmakuMessage(content: chat.content, color: 0xFFFFFF, senderName: chat.nickName)
+            messages.append(danmaku)
+            if messages.count > 200 { messages.removeFirst(messages.count - 200) }
+        } catch {
+            AppLogger.error("DouyinDanmakuService: ChatMessage 解析失败 — rawPayload len=\(payloadData.count) hex0:32=\(payloadData.prefix(32).map { String(format: "%02x", $0) }.joined(separator: " "))")
         }
-        let userName = (json["user"] as? [String: Any])?["nickname"] as? String ?? ""
-        let danmaku = DanmakuMessage(content: text, color: 0xFFFFFF, senderName: userName)
-        messages.append(danmaku)
-        if messages.count > 200 { messages.removeFirst(messages.count - 200) }
     }
 
     private func handleRoomStats(_ msg: MessageData) {
-        // payload JSON: {"display_long": "1234", "display_short": "1.2万", ...}
-        guard let payloadData = msg.payload.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
-              let count = json["display_long"] as? Int else {
-            return
+        // RoomStatsMessage proto:
+        //   displayShort = 2 (如 "1.2万")
+        //   displayLong  = 4 (如 "1234" 或 "1234在线观众" 或 "1.2万在线观众")
+        guard let payloadData = msg.rawPayload, payloadData.count > 0 else { return }
+        guard let stats = try? RoomStatsMessageDecoder.decode(payloadData) else { return }
+        if let n = Self.parseViewerCount(from: stats.displayLong) {
+            if n != viewerCount {
+                AppLogger.info("DouyinDanmakuService: 直播间人数 update displayLong=\(stats.displayLong) → \(n)")
+            }
+            viewerCount = n
+        } else {
+            AppLogger.warning("DouyinDanmakuService: 解析 displayLong 失败: \(stats.displayLong)")
         }
-        viewerCount = count
+    }
+
+    /// 从抖音 displayLong (如 "1234在线观众" / "1.2万在线观众" / "12万" / "0") 提取实际人数
+    /// - 万 = ×10_000
+    /// - 千 = ×1_000
+    /// - 亿 = ×100_000_000
+    private static func parseViewerCount(from s: String) -> Int? {
+        let trimmed = s.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return nil }
+        // 提取前导数字 (整数或小数, 仅 ASCII 0-9 + ASCII 小数点)
+        var numStr = ""
+        var seenDot = false
+        for ch in trimmed {
+            if ch.isASCII && ch.isNumber {
+                numStr.append(ch)
+            } else if ch == "." && !seenDot {
+                numStr.append(".")
+                seenDot = true
+            } else {
+                break
+            }
+        }
+        guard let base = Double(numStr), base >= 0 else { return nil }
+        // 找第一个中文字符判断单位
+        var multiplier: Double = 1
+        for ch in trimmed {
+            switch ch {
+            case "万": multiplier = 10_000; break
+            case "千": multiplier = 1_000; break
+            case "亿": multiplier = 100_000_000; break
+            default: continue
+            }
+            if multiplier != 1 { break }
+        }
+        let result = base * multiplier
+        return Int(result.rounded())
     }
 }
 
@@ -293,56 +365,10 @@ extension DouyinDanmakuService: URLSessionWebSocketDelegate {
     // didOpenWithProtocol / didCloseWith 已通过 method 实现 (因为 method 用了 @MainActor 隔离,delegate 是 nonisolated)
 }
 
-// MARK: - 简化的 PushFrame 解码器
+// MARK: - 通用 protobuf wire format 工具
 
-/// 抖音 PushFrame 的简化解码器 — 我们只需要 method 和 payload 两个字段
-struct PushFrameDecoder {
-    static func decode(_ data: Data) throws -> (method: UInt64, payload: Data, payloadEncoding: String, payloadType: String) {
-        // 实测抖音帧结构 (从 skmcj/dycast 提取):
-        //   [0..8)   seqId       (uint64 LE)
-        //   [8..16)  logId       (uint64 LE)
-        //   [16..24) service      (uint64 LE)
-        //   [24..32) method      (uint64 LE)
-        //   [32..]   headers     (varint count + varint k1 + varint v1 + ... 都不定长)
-        //   然后是 varint payloadEncoding (string)
-        //   然后是 varint payloadType (string)
-        //   然后是 varint payload 长度 + payload 字节
-        //
-        // 但更简单且实测有效的做法是：
-        //   method 已知永远是 0x03 (SendMessage), 我们跳过
-        //   直接找最后一块 [varint_len][bytes] 作为 payload
-
-        var cursor = 32
-        // skip headers: 第 32 字节开始是 varint 编码的 "headers 的数量",然后每个 header 是 2 个 varint
-        guard cursor < data.count else { throw NSError(domain: "PushFrame", code: 1) }
-        let headerCount = try readVarint(data: data, offset: &cursor)
-        // 简化做法: 不解析 headers,直接扫到最后找 payload
-        // 抖音的 payload 是"压轴"字段,前面是 headers(数量 + 多对 k/v varint)
-        // 简化: 跳过 (headerCount * 2) 个 varint
-        for _ in 0..<headerCount * 2 {
-            _ = try readVarint(data: data, offset: &cursor)
-        }
-        // payloadEncoding (string): varint 长度 + bytes
-        let encodingLen = try readVarint(data: data, offset: &cursor)
-        let encodingBytes = data.subdata(in: cursor..<(cursor + Int(encodingLen)))
-        cursor += Int(encodingLen)
-        // payloadType (string): varint 长度 + bytes
-        let typeLen = try readVarint(data: data, offset: &cursor)
-        let typeBytes = data.subdata(in: cursor..<(cursor + Int(typeLen)))
-        cursor += Int(typeLen)
-        // payload: varint 长度 + bytes
-        let payloadLen = try readVarint(data: data, offset: &cursor)
-        guard cursor + Int(payloadLen) <= data.count else { throw NSError(domain: "PushFrame", code: 2) }
-        let payload = data.subdata(in: cursor..<(cursor + Int(payloadLen)))
-
-        return (
-            method: 0,
-            payload: payload,
-            payloadEncoding: String(data: encodingBytes, encoding: .utf8) ?? "",
-            payloadType: String(data: typeBytes, encoding: .utf8) ?? ""
-        )
-    }
-
+enum ProtoWire {
+    /// 读 varint (LEB128)
     static func readVarint(data: Data, offset: inout Int) throws -> UInt64 {
         var result: UInt64 = 0
         var shift: UInt64 = 0
@@ -352,143 +378,411 @@ struct PushFrameDecoder {
             result |= UInt64(byte & 0x7F) << shift
             if byte & 0x80 == 0 { return result }
             shift += 7
-            if shift > 64 { throw NSError(domain: "varint", code: 1) }
+            if shift > 70 { throw NSError(domain: "varint", code: 1) }
         }
         throw NSError(domain: "varint", code: 2)
     }
+
+    /// 写 varint (LEB128)
+    static func writeVarint(_ value: UInt64) -> Data {
+        var result = Data()
+        var v = value
+        while v >= 0x80 {
+            result.append(UInt8((v & 0x7F) | 0x80))
+            v >>= 7
+        }
+        result.append(UInt8(v))
+        return result
+    }
+
+    /// 按 wire type 跳过未知字段 (0=varint, 1=fixed64, 2=len-delimited, 5=fixed32)
+    static func skipField(data: Data, offset: inout Int, wireType: Int) throws {
+        switch wireType {
+        case 0: _ = try readVarint(data: data, offset: &offset)
+        case 1: offset += 8           // fixed64
+        case 2:
+            let len = try readVarint(data: data, offset: &offset)
+            offset += Int(len)
+        case 5: offset += 4           // fixed32
+        default: throw NSError(domain: "proto", code: 1, userInfo: [NSLocalizedDescriptionKey: "unknown wire type \(wireType)"])
+        }
+    }
 }
 
-// MARK: - 简化的 Response 解码器
+// MARK: - PushFrame 解码器 (标准 proto wire format)
+
+/// PushFrame proto (来自 douyin_live.proto):
+///   uint64 seqId = 1;
+///   uint64 logId = 2;
+///   uint64 service = 3;
+///   uint64 method = 4;
+///   repeated Header headers = 5;
+///   string payloadEncoding = 6;
+///   string payloadType = 7;
+///   bytes payload = 8;
+struct PushFrameData {
+    let logId: UInt64           // 服务端 push 时给的 id, ack 要原样回
+    let payloadEncoding: String
+    let payloadType: String
+    let payload: Data
+}
+
+struct PushFrameDecoder {
+    static func decode(_ data: Data) throws -> PushFrameData {
+        var logId: UInt64 = 0
+        var payloadEncoding = ""
+        var payloadType = ""
+        var payload = Data()
+
+        var cursor = 0
+        while cursor < data.count {
+            let tag = try ProtoWire.readVarint(data: data, offset: &cursor)
+            let fieldNumber = Int(tag >> 3)
+            let wireType = Int(tag & 0x07)
+            switch fieldNumber {
+            case 2 where wireType == 0:  // logId
+                logId = try ProtoWire.readVarint(data: data, offset: &cursor)
+            case 6 where wireType == 2:  // payloadEncoding (string)
+                let len = try ProtoWire.readVarint(data: data, offset: &cursor)
+                payloadEncoding = String(data: data.subdata(in: cursor..<(cursor + Int(len))), encoding: .utf8) ?? ""
+                cursor += Int(len)
+            case 7 where wireType == 2:  // payloadType (string)
+                let len = try ProtoWire.readVarint(data: data, offset: &cursor)
+                payloadType = String(data: data.subdata(in: cursor..<(cursor + Int(len))), encoding: .utf8) ?? ""
+                cursor += Int(len)
+            case 8 where wireType == 2:  // payload (bytes)
+                let len = try ProtoWire.readVarint(data: data, offset: &cursor)
+                payload = data.subdata(in: cursor..<(cursor + Int(len)))
+                cursor += Int(len)
+            default:
+                try ProtoWire.skipField(data: data, offset: &cursor, wireType: wireType)
+            }
+        }
+        return PushFrameData(logId: logId, payloadEncoding: payloadEncoding, payloadType: payloadType, payload: payload)
+    }
+}
+
+// MARK: - PushFrame 编码器 (心跳 + ack)
+
+enum PushFrameEncoder {
+    /// 心跳: 只写 payloadType="hb", 其余字段全默认值(proto3 不编码)
+    static func heartbeat() -> Data {
+        var d = Data()
+        d.append(0x3a)  // tag = (7<<3)|2 = 0x3a (payloadType, length-delimited)
+        d.append(0x02)
+        d.append(0x68); d.append(0x62)  // "hb"
+        return d
+    }
+
+    /// ack: logId + payloadType="ack" + payload=internalExt (saermart 的标准做法)
+    static func ack(logId: UInt64, internalExt: String) -> Data {
+        var d = Data()
+        if logId != 0 {
+            d.append(0x10)  // tag = (2<<3)|0 (logId varint)
+            d.append(ProtoWire.writeVarint(logId))
+        }
+        d.append(0x3a)  // payloadType
+        d.append(0x03)
+        d.append(0x61); d.append(0x63); d.append(0x6b)  // "ack"
+        let payloadBytes = Data(internalExt.utf8)
+        d.append(0x42)  // tag = (8<<3)|2 (payload bytes)
+        d.append(ProtoWire.writeVarint(UInt64(payloadBytes.count)))
+        d.append(payloadBytes)
+        return d
+    }
+}
+
+// MARK: - Response 解码器 (标准 proto wire format)
+//
+// Response proto:
+//   repeated Message messages = 1;
+//   string internalExt         = 3;   (saermart 用作 ack 回执, 实际暂未在 proto 文件列出)
+//   uint64 id                  = 4;
+//   uint64 result              = 5;
+//   string host                = 6;
+//   bool needAck               = (具体字段号未知, saermart 用 response.need_ack)
 
 struct ResponseData {
     let messages: [MessageData]
+    let needAck: Bool
+    let internalExt: String
 }
 
 struct MessageData {
     let method: String
-    let payload: String
+    let rawPayload: Data?   // bytes, 该消息类型的 proto (如 ChatMessage)
 }
 
 struct ResponseDecoder {
     static func decode(_ data: Data) throws -> ResponseData {
-        // Response 结构:
-        //   field 1 (messages): tag = (1<<3)|2 = 0x0A, varint count + (tag=0x0A, varint len, bytes) * count
-        //   field 4 (id):       tag = (4<<3)|0 = 0x20, varint
-        //   field 5 (result):  tag = (5<<3)|0 = 0x28, varint
-        //   field 6 (host):    tag = (6<<3)|2 = 0x32, varint len + bytes
-
         var cursor = 0
         var messages: [MessageData] = []
+        var internalExt = ""
+        var needAck = false
 
         while cursor < data.count {
-            let tag = try PushFrameDecoder.readVarint(data: data, offset: &cursor)
+            let tag = try ProtoWire.readVarint(data: data, offset: &cursor)
             let fieldNumber = Int(tag >> 3)
             let wireType = Int(tag & 0x07)
 
-            switch (fieldNumber, wireType) {
-            case (1, 2):  // messages (length-delimited, packed repeated)
-                let len = try PushFrameDecoder.readVarint(data: data, offset: &cursor)
-                let endOfMessage = cursor + Int(len)
-                let msg = try decodeMessage(data: data, start: cursor, end: endOfMessage)
+            if fieldNumber == 1 && wireType == 2 {           // messages (repeated Message)
+                let len = try ProtoWire.readVarint(data: data, offset: &cursor)
+                let end = cursor + Int(len)
+                let msg = try decodeMessage(data: data, start: cursor, end: end)
                 messages.append(msg)
-                cursor = endOfMessage
-            case (4, 0), (5, 0):  // id / result (varint)
-                _ = try PushFrameDecoder.readVarint(data: data, offset: &cursor)
-            case (6, 2):  // host (length-delimited)
-                let len = try PushFrameDecoder.readVarint(data: data, offset: &cursor)
+                cursor = end
+            } else if fieldNumber == 5 && wireType == 2 {    // internalExt (string, saermart/douyin.proto:field5)
+                let len = try ProtoWire.readVarint(data: data, offset: &cursor)
+                internalExt = String(data: data.subdata(in: cursor..<(cursor + Int(len))), encoding: .utf8) ?? ""
                 cursor += Int(len)
-            default:
-                // 未知字段,按 wire type 跳过
-                switch wireType {
-                case 0: _ = try PushFrameDecoder.readVarint(data: data, offset: &cursor)
-                case 2:
-                    let len = try PushFrameDecoder.readVarint(data: data, offset: &cursor)
-                    cursor += Int(len)
-                default:
-                    throw NSError(domain: "Response", code: 1)
-                }
+            } else if fieldNumber == 9 && wireType == 0 {    // needAck (bool, field9)
+                let v = try ProtoWire.readVarint(data: data, offset: &cursor)
+                needAck = (v != 0)
+            } else {
+                try ProtoWire.skipField(data: data, offset: &cursor, wireType: wireType)
             }
         }
-
-        return ResponseData(messages: messages)
+        return ResponseData(messages: messages, needAck: needAck, internalExt: internalExt)
     }
 
     static func decodeMessage(data: Data, start: Int, end: Int) throws -> MessageData {
         var cursor = start
         var method = ""
-        var payload = ""
+        var rawPayload: Data? = nil
 
         while cursor < end {
-            let tag = try PushFrameDecoder.readVarint(data: data, offset: &cursor)
+            let tag = try ProtoWire.readVarint(data: data, offset: &cursor)
             let fieldNumber = Int(tag >> 3)
             let wireType = Int(tag & 0x07)
 
-            switch (fieldNumber, wireType) {
-            case (1, 2):  // method (string)
-                let len = try PushFrameDecoder.readVarint(data: data, offset: &cursor)
+            if fieldNumber == 1 && wireType == 2 {            // method (string)
+                let len = try ProtoWire.readVarint(data: data, offset: &cursor)
                 method = String(data: data.subdata(in: cursor..<(cursor + Int(len))), encoding: .utf8) ?? ""
                 cursor += Int(len)
-            case (4, 2):  // payload (string)
-                let len = try PushFrameDecoder.readVarint(data: data, offset: &cursor)
-                payload = String(data: data.subdata(in: cursor..<(cursor + Int(len))), encoding: .utf8) ?? ""
+            } else if fieldNumber == 2 && wireType == 2 {     // payload (bytes, proto) — 不是 JSON!
+                let len = try ProtoWire.readVarint(data: data, offset: &cursor)
+                rawPayload = data.subdata(in: cursor..<(cursor + Int(len)))
                 cursor += Int(len)
-            case (2, 0), (3, 0):
-                _ = try PushFrameDecoder.readVarint(data: data, offset: &cursor)
-            default:
-                switch wireType {
-                case 0: _ = try PushFrameDecoder.readVarint(data: data, offset: &cursor)
-                case 2:
-                    let len = try PushFrameDecoder.readVarint(data: data, offset: &cursor)
-                    cursor += Int(len)
-                default: break
-                }
+            } else {
+                try ProtoWire.skipField(data: data, offset: &cursor, wireType: wireType)
             }
         }
-
-        return MessageData(method: method, payload: payload)
+        return MessageData(method: method, rawPayload: rawPayload)
     }
 }
 
-// MARK: - gzip 解压
+// MARK: - ChatMessage proto decoder
+//
+// message ChatMessage {
+//   Common common = 1;
+//   User user = 2;       中 nickName = field 3 (string)
+//   string content = 3;
+// }
+struct ChatMessageData {
+    let nickName: String
+    let content: String
+}
+
+enum ChatMessageDecoder {
+    static func decode(_ data: Data) throws -> ChatMessageData {
+        var cursor = 0
+        var nickName = ""
+        var content = ""
+
+        while cursor < data.count {
+            let tag = try ProtoWire.readVarint(data: data, offset: &cursor)
+            let fieldNumber = Int(tag >> 3)
+            let wireType = Int(tag & 0x07)
+
+            if fieldNumber == 2 && wireType == 2 {   // User (nested)
+                let len = try ProtoWire.readVarint(data: data, offset: &cursor)
+                nickName = try decodeUserNickName(data: data, start: cursor, length: Int(len))
+                cursor += Int(len)
+            } else if fieldNumber == 3 && wireType == 2 {  // content (string)
+                let len = try ProtoWire.readVarint(data: data, offset: &cursor)
+                content = String(data: data.subdata(in: cursor..<(cursor + Int(len))), encoding: .utf8) ?? ""
+                cursor += Int(len)
+            } else {
+                try ProtoWire.skipField(data: data, offset: &cursor, wireType: wireType)
+            }
+        }
+        return ChatMessageData(nickName: nickName, content: content)
+    }
+
+    private static func decodeUserNickName(data: Data, start: Int, length: Int) throws -> String {
+        // message User { ... string nickName = 3; ... }
+        let end = start + length
+        var cursor = start
+        var nick = ""
+        while cursor < end {
+            let tag = try ProtoWire.readVarint(data: data, offset: &cursor)
+            let fieldNumber = Int(tag >> 3)
+            let wireType = Int(tag & 0x07)
+            if fieldNumber == 3 && wireType == 2 {
+                let len = try ProtoWire.readVarint(data: data, offset: &cursor)
+                nick = String(data: data.subdata(in: cursor..<(cursor + Int(len))), encoding: .utf8) ?? ""
+                cursor += Int(len)
+                break
+            } else {
+                try ProtoWire.skipField(data: data, offset: &cursor, wireType: wireType)
+            }
+        }
+        return nick
+    }
+}
+
+// MARK: - RoomStatsMessage proto decoder
+//
+// message RoomStatsMessage {
+//   Common common = 1;
+//   string displayShort = 2;
+//   string displayMiddle = 3;
+//   string displayLong = 4;
+//   int64 displayValue = 5;
+//   int64 total = 9;
+// }
+enum RoomStatsMessageDecoder {
+    static func decode(_ data: Data) throws -> (displayLong: String, displayShort: String, total: Int64) {
+        var cursor = 0
+        var displayLong = ""
+        var displayShort = ""
+        var total: Int64 = 0
+        while cursor < data.count {
+            let tag = try ProtoWire.readVarint(data: data, offset: &cursor)
+            let fieldNumber = Int(tag >> 3)
+            let wireType = Int(tag & 0x07)
+            if fieldNumber == 2 && wireType == 2 {
+                let len = try ProtoWire.readVarint(data: data, offset: &cursor)
+                displayShort = String(data: data.subdata(in: cursor..<(cursor + Int(len))), encoding: .utf8) ?? ""
+                cursor += Int(len)
+            } else if fieldNumber == 4 && wireType == 2 {
+                let len = try ProtoWire.readVarint(data: data, offset: &cursor)
+                displayLong = String(data: data.subdata(in: cursor..<(cursor + Int(len))), encoding: .utf8) ?? ""
+                cursor += Int(len)
+            } else if fieldNumber == 9 && wireType == 0 {
+                let v = try ProtoWire.readVarint(data: data, offset: &cursor)
+                total = Int64(bitPattern: v)
+            } else {
+                try ProtoWire.skipField(data: data, offset: &cursor, wireType: wireType)
+            }
+        }
+        return (displayLong, displayShort, total)
+    }
+}
+
+// MARK: - gzip 解压 (RFC 1952) — 走 Apple Compression 框架 (raw deflate → 加 zlib 头)
 
 extension Data {
+    /// 解压 gzip (1f 8b 头). 手动剥掉 gzip 头/尾, 用 libz 直接解 raw deflate (windowBits=-15).
+    /// - 抖音 payload 是 gzip (RFC 1952), 剥掉头/尾后是 raw deflate (RFC 1951)
+    /// - Apple `COMPRESSION_ZLIB` 框架**不能**解 raw deflate (会失败或产生乱码)
+    /// - 必须用 libz 的 `inflate` 配合 windowBits=-15
     func gunzipped() throws -> Data {
-        let bufferSize = 4096
+        guard count >= 18 else { throw NSError(domain: "gzip", code: 1, userInfo: [NSLocalizedDescriptionKey: "too short"]) }
+        guard self[0] == 0x1f, self[1] == 0x8b else { throw NSError(domain: "gzip", code: 2, userInfo: [NSLocalizedDescriptionKey: "not gzip magic"]) }
+
+        // 解析 gzip header (RFC 1952):
+        //   magic(2) + CM(1) + FLG(1) + MTIME(4) + XFL(1) + OS(1) = 10 字节 (基本头)
+        var p = 2
+        let cm = self[p]; p += 1
+        guard cm == 8 else { throw NSError(domain: "gzip", code: 3, userInfo: [NSLocalizedDescriptionKey: "bad cm=\(cm)"]) }
+        let flg = self[p]; p += 1
+        p += 4                              // mtime
+        p += 1                              // xfl
+        p += 1                              // os  ← 这一行之前漏了! 导致 deflateStart 错位 1 字节
+        if flg & 0x04 != 0 {                // FNAME
+            while p < count, self[p] != 0 { p += 1 }
+            p += 1
+        }
+        if flg & 0x10 != 0 {                // FCOMMENT
+            while p < count, self[p] != 0 { p += 1 }
+            p += 1
+        }
+        if flg & 0x02 != 0 { p += 2 }       // FHCRC
+        guard p < count - 8 else { throw NSError(domain: "gzip", code: 4) }
+        let deflateStart = p
+        let deflateLen = count - 8 - p
+        let deflateData = self.subdata(in: deflateStart..<(deflateStart + deflateLen))
+
+        // 走 libz 直接调 inflate
+        return try gunzippedLibZ(deflateData: deflateData)
+    }
+
+    /// libz 路径: 用 dlsym 加载 libz, 调 inflateInit2_ + inflate + inflateEnd
+    /// 失败时回退到 zlib Swift module (旧路径, 保留作 backup)
+    private func gunzippedLibZ(deflateData: Data) throws -> Data {
+        // 加载 libz
+        guard let handle = dlopen("/usr/lib/libz.dylib", RTLD_NOW) else {
+            throw NSError(domain: "gzip", code: 10, userInfo: [NSLocalizedDescriptionKey: "dlopen libz failed"])
+        }
+        typealias InitFn = @convention(c) (UnsafeMutablePointer<z_stream>?, Int32, UnsafePointer<CChar>?, Int32) -> Int32
+        typealias InflateFn = @convention(c) (UnsafeMutablePointer<z_stream>?, Int32) -> Int32
+        typealias EndFn = @convention(c) (UnsafeMutablePointer<z_stream>?) -> Int32
+        guard let initPtr = dlsym(handle, "inflateInit2_"),
+              let infPtr = dlsym(handle, "inflate"),
+              let endPtr = dlsym(handle, "inflateEnd") else {
+            throw NSError(domain: "gzip", code: 11, userInfo: [NSLocalizedDescriptionKey: "dlsym libz funcs failed"])
+        }
+        let inflateInit2Fn = unsafeBitCast(initPtr, to: InitFn.self)
+        let inflateFn = unsafeBitCast(infPtr, to: InflateFn.self)
+        let inflateEndFn = unsafeBitCast(endPtr, to: EndFn.self)
+
+        // 初始化 stream (-15 = raw deflate)
+        var stream = z_stream(
+            next_in: nil, avail_in: 0, total_in: 0,
+            next_out: nil, avail_out: 0, total_out: 0,
+            msg: nil, state: nil,
+            zalloc: nil, zfree: nil, opaque: nil,
+            data_type: 0, adler: 0, reserved: 0
+        )
+        let initRet: Int32 = ZLIB_VERSION.withCString { verPtr in
+            inflateInit2Fn(&stream, -15, verPtr, Int32(MemoryLayout<z_stream>.size))
+        }
+        guard initRet == 0 else {
+            throw NSError(domain: "gzip", code: 12, userInfo: [NSLocalizedDescriptionKey: "inflateInit2 failed: \(initRet)"])
+        }
+        defer { inflateEndFn(&stream) }
+
+        // 分配输出 buffer (12x 输入, 一般 deflate ratio 2-5x)
+        let outSize = Swift.max(64 * 1024, deflateData.count * 12)
+        let outBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: outSize)
+        defer { outBuf.deallocate() }
         var result = Data()
-        var stream = compression_stream(dst_ptr: UnsafeMutablePointer<UInt8>(bitPattern: 0)!,
-                                        dst_size: 0,
-                                        src_ptr: UnsafePointer<UInt8>(bitPattern: 0)!,
-                                        src_size: 0,
-                                        state: nil)
-        var status = compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB)
-        guard status != COMPRESSION_STATUS_ERROR else { throw NSError(domain: "gzip", code: 1) }
-        defer { compression_stream_destroy(&stream) }
+        var totalDecoded = 0
 
-        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
-        defer { buffer.deallocate() }
+        deflateData.withUnsafeBytes { (rawPtr: UnsafeRawBufferPointer) in
+            let inBase = rawPtr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            stream.next_in = UnsafeMutablePointer<UInt8>(mutating: inBase)
+            stream.avail_in = uInt(deflateData.count)
 
-        var offset = 0
-        while offset < count {
-            let inputSize = Swift.min(count - offset, bufferSize)
-            let processed = self.withUnsafeBytes { (rawBuffer: UnsafeRawBufferPointer) -> Int in
-                guard let baseAddr = rawBuffer.baseAddress else { return 0 }
-                let inputPtr = baseAddr.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
-                stream.src_ptr = inputPtr
-                stream.src_size = inputSize
-                stream.dst_ptr = buffer
-                stream.dst_size = bufferSize
-                let flags = Int32(COMPRESSION_STREAM_FINALIZE.rawValue)
-                let rv = compression_stream_process(&stream, flags)
-                if rv == COMPRESSION_STATUS_ERROR { return -1 }
-                return inputSize
+            var currentOutBuf = outBuf
+            var remaining = outSize
+
+            while true {
+                stream.next_out = currentOutBuf
+                stream.avail_out = uInt(remaining)
+                let ret = inflateFn(&stream, 0)  // Z_NO_FLUSH
+
+                let written = remaining - Int(stream.avail_out)
+                if written > 0 {
+                    result.append(currentOutBuf, count: written)
+                    totalDecoded += written
+                    currentOutBuf = currentOutBuf.advanced(by: written)
+                    remaining -= written
+                }
+
+                if ret == 1 { break }  // Z_STREAM_END
+                if ret != 0 && ret != -5 {  // Z_OK = 0, Z_BUF_ERROR = -5 (OK 继续)
+                    let msg = stream.msg.map { String(cString: $0) } ?? "?"
+                    NSLog("gunzip: inflate failed ret=\(ret) msg=\(msg)")
+                    return  // skip the rest
+                }
+                if stream.avail_in == 0 { break }  // input exhausted
+                if stream.avail_out == 0 {
+                    NSLog("gunzip: out buffer too small decoded=\(totalDecoded)")
+                    return
+                }
             }
-            if processed < 0 { throw NSError(domain: "gzip", code: 2) }
-            let written = bufferSize - Int(stream.dst_size)
-            if written > 0 {
-                result.append(buffer, count: written)
-            }
-            offset += processed
-            if processed == 0 { break }
         }
         return result
     }

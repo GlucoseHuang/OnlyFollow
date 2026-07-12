@@ -146,11 +146,15 @@ final class SyncCoordinator: ObservableObject {
         let snapshot: SyncSnapshot
         do {
             // 后台线程导出 + 编码（CPU bound）
-            snapshot = try await Task.detached(priority: .utility) {
-                let snap = await SyncExporter.exportAll(from: context)
+            // - 必须用 BACKGROUND ModelContext, 不是主 context
+            //   主 context 的 fetch 会跑在调用方 actor (主线程), 等于没后台
+            // - 用 VideoSyncBackground.run 拿到背景 ctx, 整个闭包在 detached task 里跑
+            // - SyncExporter 必须保持 nonisolated (见 SyncExporter.swift 顶部注释)
+            snapshot = try await VideoSyncBackground.run { bgContext in
+                let snap = SyncExporter.exportAll(from: bgContext)
                 _ = try SyncCodec.encode(snap) // 预热一下，顺便让编码失败在这里抛
                 return snap
-            }.value
+            }
         } catch {
             AppLogger.error("SyncCoordinator: export/encode failed: \(error.localizedDescription)")
             status = .error("导出失败: \(error.localizedDescription)")
@@ -211,9 +215,12 @@ final class SyncCoordinator: ObservableObject {
 
         // 如果是本设备自己刚写的快照,跳过 merge(自己跟自己合并没意义)
         // 但也算"已确认过状态":远端就是我们刚写的
+        // 但 populateVideoCache 还是要做: 如果本地 SwiftData 是空的(比如 app 刚重装),
+        // 云端的视频数据才能进首页
         if snap.deviceID == SyncStorage.shared.deviceID {
             AppLogger.info("SyncCoordinator: remote snapshot is from this device, marking initial pull complete")
             SyncStorage.shared.markInitialPullCompleted()
+            populateVideoCache(from: snap)
             status = .success(lastSyncedAt: lastSyncedAt ?? Date())
             return
         }

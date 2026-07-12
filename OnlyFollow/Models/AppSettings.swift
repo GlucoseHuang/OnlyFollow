@@ -155,4 +155,44 @@ enum AppSettings {
         defaults.removeObject(forKey: "bilibili_logged_uid")
         defaults.removeObject(forKey: "bilibili_logged_name")
     }
+
+    // MARK: - 弹幕密度
+
+    /// 弹幕密度模式（用户可切换，对比性能）
+    /// - off: 不显示弹幕
+    /// - sparse: 用原版贪心算法, 每条轨道上一个 lifetime 窗口只放一条, 画面上更稀疏
+    /// - dense: 用 canShoot 追击问题算法, 长弹幕走更快所以同轨可放更多, 画面更密集
+    /// 切换时触发 DanmakuFloatingView / DanmakuLiveFloatingView 重新计算轨道
+    enum DanmakuDensity: String, CaseIterable {
+        case off, sparse, dense
+
+        var label: String {
+            switch self {
+            case .off: return "关闭"
+            case .sparse: return "稀疏"
+            case .dense: return "密集"
+            }
+        }
+    }
+
+    /// 弹幕密度模式 (默认 dense, 与之前一致)
+    static var danmakuDensity: DanmakuDensity {
+        get {
+            let raw = defaults.string(forKey: "danmaku_density") ?? DanmakuDensity.dense.rawValue
+            return DanmakuDensity(rawValue: raw) ?? .dense
+        }
+        set {
+            defaults.set(newValue.rawValue, forKey: "danmaku_density")
+        }
+    }
+
+    /// 切换弹幕密度（off → sparse → dense → off 循环）
+    /// - 单独的 `set` 不能 toggle，所以提供 cycle 方法
+    static func cycleDanmakuDensity() -> DanmakuDensity {
+        let all = DanmakuDensity.allCases
+        let cur = danmakuDensity
+        let next = all[(all.firstIndex(of: cur)! + 1) % all.count]
+        danmakuDensity = next
+        return next
+    }
 }

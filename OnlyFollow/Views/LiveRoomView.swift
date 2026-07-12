@@ -37,6 +37,10 @@ struct LiveRoomView: View {
     /// 定时关闭剩余秒数；nil = 未启用
     @State private var sleepRemainingSeconds: Int?
     @State private var sleepTimerTask: Task<Void, Never>?
+    /// 当前画质 (key: ld/sd/hd/uhd/origin). nil 表示还没选, 进入直播间时挑最高
+    @State private var currentQuality: String?
+    /// 可用画质列表 (进入直播间后填入, 渲染画质菜单用)
+    @State private var availableQualities: [String: String] = [:]
     @Environment(\.dismiss) private var dismiss
 
     init(room: LiveRoom, modelContext: ModelContext) {
@@ -50,6 +54,7 @@ struct LiveRoomView: View {
 
             if let player {
                 AVPlayerLayerView(player: player)
+                    .id(ObjectIdentifier(player))
                     .ignoresSafeArea()
             }
 
@@ -71,14 +76,26 @@ struct LiveRoomView: View {
                 }
             }
 
-            // 弹幕叠加层（受 danmakuEnabled 控制）
+            // 弹幕叠加层（受 danmakuEnabled + danmakuDensity 控制）
             // 通过 danmakuHost 拿底层 messages（自动桥接 B/D）
-            if danmakuEnabled {
-                VStack {
-                    Spacer()
-                    DanmakuOverlayView(messages: danmakuHost.messages)
+            // - 抖音直播：飘屏，跟 B 站视频 DanmakuFloatingView 视觉一致（5 轨道、6s lifetime、40pt 基础字号等）
+            // - B 站直播：保持左下角简单滚动列表不动
+            if danmakuEnabled && AppSettings.danmakuDensity != .off {
+                if room.platform == "douyin" {
+                    GeometryReader { geo in
+                        DanmakuLiveFloatingView(
+                            messages: danmakuHost.messages,
+                            activityHeight: geo.size.height / 4
+                        )
+                    }
+                    .allowsHitTesting(false)
+                } else {
+                    VStack {
+                        Spacer()
+                        DanmakuOverlayView(messages: danmakuHost.messages)
+                    }
+                    .allowsHitTesting(false)
                 }
-                .allowsHitTesting(false)
             }
 
             // 控件层（顶栏 + 底栏 + 渐变背景）。锁定时整个隐藏，只剩锁按钮
@@ -91,6 +108,10 @@ struct LiveRoomView: View {
             // 关键：放在 controlsOverlay 之外，这样它不会被 showControls gate 掉
             lockButton
         }
+        .playbackGestures(
+            enabled: !isLocked,
+            supportsSeek: false
+        )
         .preferredColorScheme(.dark)
         // 视频侧的状态栏策略：全屏时隐藏，否则正常
         .statusBarHidden(isFullscreen)
@@ -100,6 +121,8 @@ struct LiveRoomView: View {
             tapSurface()
         }
         .task {
+            // 挂上系统音量调节所需的隐藏 MPVolumeView(幂等)
+            SystemVolumeController.shared.attach()
             loadTask = Task { await load() }
             await loadTask?.value
         }
@@ -154,7 +177,8 @@ struct LiveRoomView: View {
                     Circle().fill(.green).frame(width: 8, height: 8)
                 }
                 Image(systemName: "eye").font(.caption)
-                Text("\(room.viewerCount)")
+                // 优先显示 WS 实时人数 (danmakuHost.viewerCount), 没收到时回退到 API 初始值
+                Text("\(danmakuHost.viewerCount > 0 ? danmakuHost.viewerCount : room.viewerCount)")
                     .font(.caption.monospacedDigit())
             }
             .foregroundStyle(.white)
@@ -164,14 +188,38 @@ struct LiveRoomView: View {
         }
     }
 
+    /// 弹幕密度按钮的 icon（与视频侧一致）
+    private var danmakuMenuIcon: String {
+        switch AppSettings.danmakuDensity {
+        case .off: return "text.bubble"
+        case .sparse: return "text.bubble"
+        case .dense: return "text.bubble.fill"
+        }
+    }
+
     private var bottomBar: some View {
         HStack(spacing: 24) {
-            // 弹幕开关（与视频侧 toggleDanmaku 一致）
-            Button { toggleDanmaku() } label: {
-                Image(systemName: danmakuEnabled ? "text.bubble.fill" : "text.bubble")
+            // 弹幕密度: Menu 三档 (off / sparse / dense), 直播场景用户可以对比两种算法
+            Menu {
+                ForEach(AppSettings.DanmakuDensity.allCases, id: \.self) { mode in
+                    Button {
+                        AppSettings.danmakuDensity = mode
+                    } label: {
+                        HStack {
+                            Text(mode.label)
+                            if mode == AppSettings.danmakuDensity {
+                                Spacer()
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: danmakuMenuIcon)
                     .font(.title3)
-                    .foregroundStyle(danmakuEnabled ? .yellow : .white)
+                    .foregroundStyle(AppSettings.danmakuDensity == .off ? .white : .yellow)
             }
+            .accessibilityLabel("弹幕密度")
 
             // 播放 / 暂停
             Button { togglePlay() } label: {
@@ -182,6 +230,20 @@ struct LiveRoomView: View {
 
             Spacer()
 
+            // 抖音专属: 刷新按钮 (从最新时间点重新拉流)
+            if room.platform == "douyin" {
+                Button { refreshStream() } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.title3)
+                        .foregroundStyle(.white)
+                }
+            }
+
+            // 抖音专属: 画质选择 (B 站是单流没得选)
+            if room.platform == "douyin" && !availableQualities.isEmpty {
+                qualityMenu
+            }
+
             // 定时关闭
             sleepTimerButton
 
@@ -191,6 +253,44 @@ struct LiveRoomView: View {
                     .font(.title3)
                     .foregroundStyle(.white)
             }
+        }
+    }
+
+    /// 抖音画质选择 Menu
+    /// - 5 档按 sdk_key 排序: origin > uhd > hd > sd > ld
+    /// - 抖音原生命名: 原画/蓝光/超清/高清/标清
+    private var qualityMenu: some View {
+        let labels: [String: String] = [
+            "origin": "原画",
+            "uhd": "蓝光",
+            "hd": "超清",
+            "sd": "高清",
+            "ld": "标清",
+        ]
+        let order = ["origin", "uhd", "hd", "sd", "ld"]
+        let currentLabel = labels[currentQuality ?? ""] ?? "画质"
+        return Menu {
+            ForEach(order, id: \.self) { key in
+                if let _ = availableQualities[key] {
+                    Button {
+                        selectQuality(key)
+                    } label: {
+                        if key == currentQuality {
+                            Label(labels[key] ?? key, systemImage: "checkmark")
+                        } else {
+                            Text(labels[key] ?? key)
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.title3)
+                Text(currentLabel)
+                    .font(.caption.bold())
+            }
+            .foregroundStyle(.white)
         }
     }
 
@@ -452,10 +552,10 @@ struct LiveRoomView: View {
     /// - 1) 优先用 sec_uid 调 user profile 拿 stream URL (绕过 enter 接口, enter 接口对部分房间返回 4001038)
     /// - 2) fallback: 调 DouyinAPIService.fetchLiveRoom (webcast/room/web/enter/)
     /// - 3) DouyinDanmakuService 构造好后 attach 到 host，host.connect()
+    /// - 进入时: 优先 user profile 的画质字典; 缺则 enter API (此时没有画质字典, 仅单 streamURL)
     private func loadDouyin() async {
         let api = DouyinAPIService.shared
         var streamURLString = ""
-        // HLS 优先 (AVPlayer 原生支持)，FLV 作为 fallback (后续可接 IJKPlayer)
         var streamFormat = ""
 
         // 1a) 优先: user profile API 拿 stream URL (实测更稳定, enter 接口对某些房间返回 4001038)
@@ -465,6 +565,17 @@ struct LiveRoomView: View {
                 if let info = user.liveRoomInfo, let url = pickPlayableStreamURL(from: info), !url.isEmpty {
                     streamURLString = url
                     streamFormat = "user_profile"
+                    // 画质字典也保存下来 (画质切换 UI 用)
+                    if !info.hlsURLsByQuality.isEmpty {
+                        availableQualities = info.hlsURLsByQuality
+                        // 默认选最高: 优先 origin > uhd > hd > sd > ld
+                        let order = ["origin", "uhd", "hd", "sd", "ld"]
+                        for q in order where availableQualities[q] != nil {
+                            currentQuality = q
+                            break
+                        }
+                        AppLogger.info("LiveRoom: 抖音画质字典 keys=\(availableQualities.keys.sorted().joined(separator: ",")) 默认=\(currentQuality ?? "nil")")
+                    }
                     AppLogger.info("LiveRoom: user profile 拿到抖音直播流 url=\(url.prefix(80))...")
                 } else if let info = user.liveRoomInfo, info.isLiving {
                     loadError = "该抖音主播当前未开播"
@@ -483,6 +594,7 @@ struct LiveRoomView: View {
                 if info.isLiving {
                     streamURLString = info.hlsURL ?? info.flvURL ?? ""
                     streamFormat = "enter_api"
+                    // enter API 一般没画质字典
                 } else {
                     loadError = "该抖音主播当前未开播"
                     return
@@ -503,43 +615,7 @@ struct LiveRoomView: View {
         AppLogger.info("LiveRoom: 完整 URL (前 200) = \(url.absoluteString.prefix(200))")
         streamURL = url
 
-        // 调试: 检查 URL 是否可播放 (FLV 格式 macOS AVPlayer 默认不支持, 这里提前发现)
-        let asset = AVURLAsset(url: url)
-        AppLogger.info("LiveRoom: asset created, duration=async, isPlayable=待查")
-
-        let p = AVPlayer(url: url)
-        p.allowsExternalPlayback = true
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
-        try? AVAudioSession.sharedInstance().setActive(true)
-
-        // 调试: KVO 监听 currentItem.status 和 AVPlayerItem.error, 拿到真实错误原因
-        let observer = LiveRoomPlayerObserver(player: p)
-        observer.start()
-        playerObserver = observer
-
-        p.play()
-        player = p
-
-        // 调试: 异步查 asset.isPlayable + 是否有视频/音轨, 看 AVPlayer 是否真的能解 FLV
-        Task { @MainActor in
-            do {
-                let isPlayable = try await asset.load(.isPlayable)
-                AppLogger.info("LiveRoom: asset.isPlayable=\(isPlayable)")
-                let videoTracks = try await asset.loadTracks(withMediaType: .video)
-                let audioTracks = try await asset.loadTracks(withMediaType: .audio)
-                AppLogger.info("LiveRoom: asset tracks video=\(videoTracks.count) audio=\(audioTracks.count)")
-                for (i, track) in videoTracks.enumerated() {
-                    let descs = try await track.load(.formatDescriptions)
-                    if let desc = descs.first {
-                        let formatDesc = desc as CMFormatDescription
-                        let mediaSubType = CMFormatDescriptionGetMediaSubType(formatDesc)
-                        AppLogger.info("LiveRoom: video track \(i) codec=0x\(String(mediaSubType, radix: 16, uppercase: true))")
-                    }
-                }
-            } catch {
-                AppLogger.error("LiveRoom: asset load failed: \(error.localizedDescription)")
-            }
-        }
+        playURL(url)
 
         // 2) 抖音弹幕：构造 DouyinDanmakuService → attach → connect
         // 注意：房间在开播状态下 room.roomID 已经是真实 room_id（webcast_id 与 room_id 同一个值在 douyin 当前的 enter 接口中）
@@ -549,6 +625,70 @@ struct LiveRoomView: View {
         )
         danmakuHost.attach(douyin: douyinService)
         await danmakuHost.connect()
+    }
+
+    /// 加载一个直播流 URL 到 AVPlayer（包含暂停旧 player / 建新 player / 自动播放）
+    /// - 用于首次加载 / 刷新 / 切画质
+    /// - 不动 danmakuHost (弹幕连接保持)
+    private func playURL(_ url: URL) {
+        // 停掉旧 player
+        player?.pause()
+        playerObserver = nil
+
+        let asset = AVURLAsset(url: url)
+
+        let p = AVPlayer(url: url)
+        p.allowsExternalPlayback = true
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+        try? AVAudioSession.sharedInstance().setActive(true)
+
+        let observer = LiveRoomPlayerObserver(player: p)
+        observer.start()
+        playerObserver = observer
+
+        p.play()
+        player = p
+        isPlaying = true
+
+        // 异步查 asset 信息 (调不调用都行, 主要看 isPlayable)
+        Task { @MainActor in
+            do {
+                let isPlayable = try await asset.load(.isPlayable)
+                AppLogger.info("LiveRoom: asset.isPlayable=\(isPlayable) (URL=\(url.absoluteString.prefix(80)))")
+            } catch {
+                AppLogger.error("LiveRoom: asset load failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// 抖音专属: 刷新直播流 (从最新时间点重新拉, 用于卡顿时追平)
+    /// - 保留弹幕连接 (WS 跟房间绑定, 不用重连)
+    /// - 重新走 loadDouyin 拿新 HLS URL
+    private func refreshStream() {
+        AppLogger.info("LiveRoom: 刷新直播流 roomID=\(room.roomID)")
+        Task {
+            loadError = nil
+            // 先关掉旧 player, 然后重 fetch + 自动 play
+            player?.pause()
+            player = nil
+            playerObserver = nil
+            streamURL = nil
+            await loadDouyin()
+        }
+    }
+
+    /// 抖音专属: 切换画质 (从 availableQualities 字典拿对应 URL, 重建 player)
+    /// - 不重 fetch (画质 URL 来自同一份 stream_data, 不会过期)
+    private func selectQuality(_ quality: String) {
+        guard let urlStr = availableQualities[quality], let url = URL(string: urlStr) else {
+            AppLogger.warning("LiveRoom: 切画质失败 quality=\(quality) 找不到 URL")
+            return
+        }
+        AppLogger.info("LiveRoom: 切画质 \(currentQuality ?? "nil") -> \(quality) URL host=\(url.host ?? "nil")")
+        currentQuality = quality
+        streamURL = url
+        playURL(url)
+        scheduleControlsHide()
     }
 
     /// 写 LiveHistory：已存在则更新 watchedAt + 元数据（防止 UP 主改名 / 换头像后历史列表还停留在旧值）

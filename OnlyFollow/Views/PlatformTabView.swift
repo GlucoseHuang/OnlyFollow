@@ -164,18 +164,33 @@ struct PlatformTabView: View {
 
     /// 批量拉取进度（B 站 creator 的补全状态）
     /// - 触发重渲染：@Query creators，任一 creator 的 bulkFetchCompletedAt 变化都会更新
-    private var bulkFetchProgress: (done: Int, total: Int) {
+    /// - 修复 Bug 1: 不仅看 completedAt 状态,还要看 cache 视频数 == total 才算"真正完成"
+    ///   防止"cache 满了但 completedAt 丢了"导致 banner 永远显示
+    private var bulkFetchProgress: (done: Int, total: Int, pending: Int) {
         let bili = creators.filter { $0.platform == "bilibili" }
-        let done = bili.filter { $0.bulkFetchCompletedAt != nil }.count
-        return (done, bili.count)
+        // done 判定: completedAt != nil OR cache 视频数 >= total(都算"已完整")
+        let done = bili.filter { c in
+            if c.bulkFetchCompletedAt != nil { return true }
+            let cached = VideoCache.shared.videos(for: c.uid)?.count ?? 0
+            return c.bulkFetchTotal > 0 && cached >= c.bulkFetchTotal
+        }.count
+        // DEBUG: 验证 Bug 1 - banner 显示的具体条件
+        let details = bili.map { c -> String in
+            let cached = VideoCache.shared.videos(for: c.uid)?.count ?? 0
+            let isComplete = c.bulkFetchCompletedAt != nil || (c.bulkFetchTotal > 0 && cached >= c.bulkFetchTotal)
+            return "\(c.nickname)(uid=\(c.uid), completedAt=\(c.bulkFetchCompletedAt?.description ?? "nil"), total=\(c.bulkFetchTotal), cached=\(cached), isComplete=\(isComplete))"
+        }.joined(separator: "; ")
+        AppLogger.info("DEBUG bulkFetchProgress: done=\(done)/\(bili.count) → \(details)")
+        return (done, bili.count, bili.count - done)
     }
 
-    /// 批量拉取进度横幅：只在 B 站 tab + 有 pending 工作时显示
+    /// 批量拉取进度横幅：只在 B 站 tab + 有真正 pending 的 creator 时显示
+    /// - 真正 pending: completedAt == nil **且** cache 视频数 < total
     @ViewBuilder
     private var bulkFetchProgressBanner: some View {
         if selectedPlatform == .bilibili {
             let p = bulkFetchProgress
-            if p.total > 0 && p.done < p.total {
+            if p.total > 0 && p.pending > 0 {
                 HStack(spacing: 10) {
                     Image(systemName: "arrow.down.circle")
                         .foregroundStyle(.blue)

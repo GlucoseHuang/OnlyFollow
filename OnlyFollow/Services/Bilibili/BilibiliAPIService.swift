@@ -34,6 +34,14 @@ actor BilibiliAPIService {
         consecutiveRateLimits = 0
     }
 
+    /// 最近一次请求是否被限流 / 风控（用于 bulk fetch loop 检测到"还有下一页但其实是被限流暂停"的情况）
+    /// - 命中过 -799 / 412 → 大概率还在冷却(指数退避 15s),继续 sleep 只会浪费
+    /// - 命中过 -352 / -403 → 验证码/风控,继续 sleep 也没用
+    /// - 都返回 true:调用方应当 break 循环
+    func isLikelyRateLimitedOrAntiCrawler() -> Bool {
+        return consecutiveRateLimits > 0
+    }
+
     private func waitForRateLimit() async {
         let now = Date()
 
